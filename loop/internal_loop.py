@@ -1,0 +1,1014 @@
+import time
+import math
+import sys
+import threading
+import torch
+import torch.nn.functional as F
+
+from config.model_config import ReflexConfig
+from loop.dialectical_buffer import DialecticalBuffer
+from loop.gradient_manager import GradientManager
+from interaction.manager import InteractionManager
+from learn.hebbian_update import focal_update
+from learn.replay import PriorityReplayBuffer
+from learn.critical_noise import CriticalNoiseScheduler
+from learn.confusion_map import ConfusionMap
+from learn.fluid_roles import FluidExpertRoles
+from improve.architecture import ArchitectureModifier
+
+
+class InternalLoop:
+    """
+    Event-driven internal learning loop — v2 with five philosophical upgrades:
+
+    1. Self-regulated critical noise (replaces annealed schedule)
+       → System maintains itself at the edge of chaos via sigma feedback.
+
+    2. Dialectical memory buffer (replaces flat deque)
+       → States classified into theses/antitheses/syntheses.
+       The system thinks most about what it's confused about.
+
+    3. Emergent question timing (replaces hardcoded cooldown)
+       → No fixed step counter. The model asks when sigma is genuinely high,
+       and stops asking when learning brings sigma down.
+
+    4. Fluid expert roles (replaces fixed stable/plastic spectrum)
+       → Experts that are consistently certain become more stable;
+       experts that are consistently confused become more plastic.
+
+    5. Concept-level confusion map (replaces token-only tracking)
+       → The model tracks recurring knowledge gaps across turns.
+    """
+
+    def __init__(self, model, config: ReflexConfig = None,
+                 interaction_mgr: InteractionManager = None):
+        self.model = model
+        self.config = config or model.config
+        self.interaction = interaction_mgr or InteractionManager(config)
+
+        self._event = threading.Event()
+        self._event.set()
+        self._running = True
+        self._step_done = threading.Event()
+        self._step_done.set()  # initially "no step in progress"
+
+        self._step_count = 0
+        self._total_steps = 0
+        self._loss_history = []
+
+        self._gradient_mgr = GradientManager(config.n_layers)
+        self._replay_buffer = PriorityReplayBuffer(
+            config.replay_capacity, config.d_model
+        )
+
+        # ── Upgrade 1: Critical noise scheduler ──
+        self._noise_scheduler = CriticalNoiseScheduler(
+            target_sigma=config.internal_entropy_threshold,
+            noise_min=config.noise_min,
+            noise_max=config.noise_max,
+        )
+
+        # ── 记忆系统 v4: 内部循环的记忆 KV（缓存，轮次变化时重建）──
+        self._mem_kv = None
+        self._mem_kv_n = -1
+
+        # ── Upgrade 2: Dialectical buffer (replaces EndoSphereBuffer) ──
+        if hasattr(model, 'endosphere'):
+            # Replace the model's flat buffer with dialectical one
+            old_buf = model.endosphere
+            model.endosphere = DialecticalBuffer(
+                config.d_model, config.endosphere_capacity,
+                config.verify_threshold
+            )
+            # Migrate any sequence data
+            if hasattr(old_buf, 'seq_buffer'):
+                model.endosphere._seq_buffer = old_buf.seq_buffer
+
+        # ── Upgrade 4: Fluid expert roles ──
+        self._fluid_roles = FluidExpertRoles(config)
+
+        # ── Upgrade 5: Confusion map ──
+        self._confusion_map = ConfusionMap()
+
+        # ── Stage K: Architecture self-modification ──
+        self._arch_modifier = ArchitectureModifier(config)
+
+        # ── v2: SelfModel state ──
+        self._h_t = None
+        self._z_t = None
+        self._kl_value = 0.0
+        self._curiosity_beta = getattr(config, 'curiosity_beta', 0.1)
+        self._imagination_lambda = getattr(config, 'imagination_lambda', 1.0)
+        self._stability_lambda = getattr(config, 'stability_lambda', 0.01)
+
+        # SelfModel optimizer
+        if (getattr(self.model, 'self_model', None) is not None
+                and getattr(config, 'self_model_enabled', True)):
+            self._self_model_optimizer = torch.optim.AdamW(
+                self.model.self_model.parameters(),
+                lr=getattr(config, 'cont_lr', 1e-4),
+                weight_decay=0.01,
+            )
+        else:
+            self._self_model_optimizer = None
+
+        self._v_t = None
+        self._u_next_input = None
+        self._loss_int = None
+        self._last_sigma = 0.5
+        self._internal_sigma = 0.5
+        self._prev_v_pred = None
+
+        # ── Global optimizer: 事后回放全局巩固 ──
+        # 更新 Attention + Router + LM Head + RMSNorm + AttnRes
+        # Expert 权重由 Hebbian 局部更新，Embedding 冻结
+        # lr=1e-6，比 Hebbian 最快 plastic expert (1e-5) 慢 10x
+        global_params = []
+        for name, p in model.named_parameters():
+            if any(k in name for k in
+                   ['attention', 'router', 'lm_head',
+                    'ln_f', 'ln1', 'ln2',
+                    'q_norm', 'k_norm', 'q_proj', 'kv_proj', 'o_proj',
+                    'attn_res', 'post_norm', 'memory_bank']):
+                if p.requires_grad:
+                    global_params.append(p)
+        self._global_optimizer = torch.optim.AdamW(
+            global_params, lr=1e-6, weight_decay=0.01,
+            betas=(0.9, 0.95),
+        ) if global_params else None
+        self._global_param_count = len(global_params)
+
+        # 快照全局参数初始值（用于 stats 显示变化量）
+        self._global_snapshot = None
+        if global_params:
+            self._global_snapshot = [p.data.clone() for p in global_params]
+
+    # ── Public API ────────────────────────────────────────────────
+
+    def start(self):
+        self._running = True
+        self._event.set()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def pause(self):
+        """Pause the loop.  Does not return until the current step
+        has completed, ensuring no model access race with the pipeline."""
+        self._event.clear()
+        # Wait for the current step to fully complete (all stages A-K),
+        # not just the lock-protected portion.
+        self._step_done.wait()
+        # Additionally acquire the model lock to synchronise with any
+        # lingering lock-holding section.
+        if hasattr(self.model, '_lock'):
+            with self.model._lock:
+                pass
+
+    def resume(self):
+        self._event.set()
+
+    def stop(self, timeout=5.0):
+        self._event.set()
+        self._running = False
+        if hasattr(self, '_thread') and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+    @property
+    def step_count(self):
+        return self._total_steps
+
+    @property
+    def confusion_map(self):
+        return self._confusion_map
+
+    @property
+    def noise_scheduler(self):
+        return self._noise_scheduler
+
+    @property
+    def dialectical_stats(self):
+        if hasattr(self.model.endosphere, 'get_dialectical_stats'):
+            return self.model.endosphere.get_dialectical_stats()
+        return {}
+
+    @property
+    def global_drift(self):
+        """全局参数相对初始值的最大变化量（用于 stats 显示）。"""
+        if self._global_optimizer is None or self._global_snapshot is None:
+            return 0.0
+        max_drift = 0.0
+        idx = 0
+        with self.model._lock:
+            for name, p in self.model.named_parameters():
+                if any(k in name for k in
+                       ['attention', 'router', 'lm_head',
+                        'ln_f', 'ln1', 'ln2',
+                        'q_norm', 'k_norm', 'q_proj', 'kv_proj', 'o_proj',
+                        'attn_res', 'post_norm']):
+                    if p.requires_grad and idx < len(self._global_snapshot):
+                        drift = (p.data - self._global_snapshot[idx]).abs().max().item()
+                        if drift > max_drift:
+                            max_drift = drift
+                        idx += 1
+        return max_drift
+
+    @property
+    def global_param_count(self):
+        return self._global_param_count
+
+    # ── Internal loop ─────────────────────────────────────────────
+
+    def _loop(self):
+        while self._running:
+            self._event.wait()
+            try:
+                self._execute_step()
+                self._total_steps += 1
+                self.model._internal_step_count = self._total_steps
+            except Exception as e:
+                import traceback
+                self._loss_history.append({'error': str(e)})
+                # 打印完整 traceback 到 stderr（部署诊断用）
+                print(f'\n[INTERNAL LOOP ERROR step={self._total_steps}] '
+                      f'{type(e).__name__}: {e}', file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                print('', file=sys.stderr)
+
+    def _execute_step(self):
+        self._step_done.clear()
+        try:
+            self._execute_step_inner()
+        finally:
+            self._step_done.set()
+
+    def _execute_step_inner(self):
+        # ── Stage A: Forward with self-regulated noise ──
+        v_t = self._get_state()
+        if v_t is None:
+            v_t = self._init_state()
+
+        device = next(self.model.parameters()).device
+        v_t = v_t.to(device)
+
+        # v2: noise driven by KL curiosity (if available), fallback to sigma
+        if self._kl_value > 0:
+            sigma_for_noise = min(self._kl_value / max(self._curiosity_beta, 0.01), 1.0)
+        else:
+            sigma_for_noise = self._last_sigma
+        noise = self._noise_scheduler.get_noise(sigma_for_noise)
+        if noise > 0:
+            v_t = v_t + noise * torch.randn_like(v_t)
+
+        with self.model._lock:
+            self.model.train()
+
+            # Sync SelfModel state from model
+            self._h_t = getattr(self.model, '_h_state', None)
+            self._z_t = getattr(self.model, '_z_state', None)
+
+            # SelfModel imagination: h_t, z_t, action → z_prior
+            sm = getattr(self.model, 'self_model', None)
+            if sm is not None and self._h_t is not None and self._z_t is not None:
+                h_t = self._h_t.to(device)
+                z_t = self._z_t.to(device)
+                action = v_t.unsqueeze(0) if v_t.dim() == 1 else v_t
+                if action.dim() == 1:
+                    action = action.unsqueeze(0)
+
+                h_next, z_mean, z_logvar = sm(h_t, z_t, action)
+                self._z_prior_mean = z_mean
+                self._z_prior_logvar = z_logvar
+                z_sample = sm.sample_z(z_mean, z_logvar)
+                u_next = sm.decode(z_sample, h_next).squeeze(0)
+
+                self.model._h_state = h_next.detach()
+                self.model._z_state = z_sample.detach()
+                self._h_t = h_next.detach()
+                self._z_t = z_sample.detach()
+            else:
+                u_next = v_t
+                h_next = None
+
+            u_next_input = self._ema_blend(u_next, v_t)
+
+            pred_emb = self.model.forward_internal(
+                u_next_input, h_state=h_next,
+                mem_kv=self._get_internal_mem_kv(),
+            )
+            loss_int = self._compute_loss(pred_emb, v_t)
+
+            self._v_t = v_t
+            self._u_next_input = u_next_input
+            self._loss_int = loss_int
+            self._last_sigma = getattr(
+                self.model, '_last_sigma_aggregate', 0.5
+            )
+            self._internal_sigma = self._last_sigma
+
+            gamma = self._sigma_gamma()
+
+            # ── Stage B: Per-layer gradient-managed Hebbian update ──
+            for layer_idx, layer, retain in self._gradient_mgr.iterate_layers(
+                    loss_int, self.model.layers
+            ):
+                for expert, grad_y in self._gradient_mgr.compute_expert_gradients(
+                        loss_int, layer, retain
+                ):
+                    boost = self.model.pop_focal_boost(expert.id, 1.0)
+                    focal_update(grad_y, expert, expert.effective_lr, gamma,
+                                 focus_boost=boost)
+
+            # ── Stage B2: Gradual plastic decay (replaces abrupt soft_reset) ──
+            # Continuous gentle regularization prevents unbounded weight growth
+            # without the catastrophic amnesia of one-shot reset.
+            reg = getattr(self.config, 'plastic_reg_strength', 1e-6)
+            if reg > 0:
+                with torch.no_grad():
+                    for expert in self.model.get_plastic_experts():
+                        for param in expert.parameters():
+                            param.data.mul_(1.0 - reg)
+
+            # ── Stage C: SelfModel update (replaces Contemplator) ──
+            self._update_self_model(u_next_input)
+
+            # ── Stage C2: Critic training ──
+            self._train_critic()
+
+            # ── Stage E: Mini-consolidation ──
+            if self._step_count > 0 and self._step_count % 50 == 0:
+                self._mini_consolidate()
+
+            # ── Stage F: Major consolidation ──
+            if self._step_count > 0 and self._step_count % 500 == 0:
+                self._major_consolidate()
+
+            # ── Stage K: Architecture self-modification (every 200 steps) ──
+            # Runs INSIDE model._lock because it mutates model.layers
+            # (append/remove/replace experts), which would race with
+            # concurrent forward passes in the inference thread.
+            if (self._step_count > 0 and self._step_count % 200 == 0
+                    and getattr(self.config, 'arch_self_mod_enabled', False)):
+                gating_stats = []
+                for layer in self.model.layers:
+                    router = layer.router
+                    stats = router.get_gating_stats()
+                    gating_stats.append(stats)
+                change = self._arch_modifier.step(
+                    self.model, gating_stats_per_layer=gating_stats,
+                )
+                if change is not None:
+                    self._rebuild_after_arch_change(change)
+
+        self.interaction.update_sigma(self._last_sigma)
+
+        # ── Stage D: Push to dialectical buffer ──
+        # Both low-loss (coherent) and high-loss (confused) states enter
+        # replay, distinguished by priority.  Confused states get high
+        # novelty so they are sampled more often during consolidation --
+        # this lets the system distil resolved confusion into stable experts.
+        loss_val = self._loss_int.item()
+        coherence = 1.0 - math.tanh(loss_val)
+        novelty = 1.0 - coherence  # high for confused states
+        self._replay_buffer.add(
+            self._u_next_input.squeeze(0).detach(),
+            loss=loss_val,
+            novelty=novelty,
+        )
+
+        prev_stats = self.dialectical_stats
+        self.model.endosphere.push(
+            self._u_next_input.squeeze(0).detach(), sigma=self._last_sigma
+        )
+        new_stats = self.dialectical_stats
+
+        # ── L3: 状态沉淀为长期记忆（语义槽，可微）──
+        mb = getattr(self.model, 'memory_bank', None)
+        if mb is not None and getattr(self.config, 'memory_enabled', True):
+            try:
+                mb.write(self._u_next_input.squeeze(0).detach())
+            except Exception:
+                pass
+
+        # ── 自发固化: salience 成熟即固化（非程序性，行为驱动）──
+        self._check_memory_consolidation()
+
+        if prev_stats and new_stats:
+            if new_stats['syntheses'] > prev_stats.get('syntheses', 0):
+                print(f"\n  [DIALECTIC] Synthesis achieved! (antithesis resolved)")
+                print(">>> ", end='', flush=True)
+
+        self._step_count += 1
+        self._loss_history.append({
+            'step': self._total_steps,
+            'loss': self._loss_int.item(),
+            'sigma': self._last_sigma,
+            'noise': self._noise_scheduler.current_noise,
+            'kl': self._kl_value,
+        })
+        if len(self._loss_history) > 10000:
+            self._loss_history = self._loss_history[-5000:]
+
+        # ── Stage G: Fluid expert role evaluation ──
+        if self._step_count % 100 == 0:
+            adjustments = self._fluid_roles.evaluate(self.model, self._total_steps)
+            if adjustments:
+                for adj in adjustments:
+                    self._loss_history.append({
+                        'step': self._total_steps,
+                        'event': 'role_transition',
+                        **adj,
+                    })
+
+        # ── Stage H: Coordinated verification generation ──
+        if self._step_count % 20 == 0:
+            self._maybe_timeout_question()
+            if self.interaction.can_ask:
+                self._try_generate_verification()
+
+    # ── Verification generation ───────────────────────────────────
+
+    def _try_generate_verification(self):
+        """
+        Emergent question generation — no templates, no mechanical
+        span extraction.  The question arises from the model's own
+        internal dialectical tension, articulated through its LM.
+
+        The model just processed the user's input.  Its hidden state
+        encodes its understanding — or lack thereof.  When sigma is
+        high, the model is confused.  We let it CONTINUE generating
+        from its own confused state: the confusion naturally surfaces
+        as a question or expression of doubt.
+
+        The internal signals (contemplator gap, sigma) modulate HOW
+        the model generates (temperature, search parameters), not
+        WHAT token to start with.  This preserves language coherence
+        while letting the internal state influence expression.
+        """
+        # 修复: 复查与 can_ask 用同一 sigma（interaction 的当前值），
+        # 避免"can_ask 用旧值过阈值、复查用新值低于阈值"的边缘抖动
+        sigma = getattr(self.interaction, '_current_model_sigma',
+                        self._last_sigma)
+        if sigma <= self.config.verify_threshold:
+            print(f'[VERIFY] sigma={sigma:.4f} <= 阈值，跳过', file=sys.stderr)
+            return
+
+        tok = self.model._decode_tokenizer
+        if tok is None:
+            return
+
+        # ── Identify the most confused expert ──
+        # C4 fix: _last_expert_sigmas only contains the LAST layer's
+        # sigmas.  Use the last layer's experts, not all experts.
+        expert_id = None
+        expert_sigmas = getattr(self.model, '_last_expert_sigmas', None)
+        if expert_sigmas is not None and expert_sigmas.numel() > 0:
+            most_confused_idx = expert_sigmas.argmax().item()
+            last_layer = self.model.layers[-1]
+            if most_confused_idx < len(last_layer.all_experts):
+                expert = last_layer.all_experts[most_confused_idx]
+                expert_id = expert.id
+
+        # ── The question emerges from continuation ──
+        question_text = self._generate_emergent_question(expert_id, sigma)
+        if not question_text or len(question_text) < 2:
+            print(f'[VERIFY] 问题生成失败 (sigma={sigma:.3f}, '
+                  f'expert={expert_id})', file=sys.stderr)
+            return
+
+        # Keep user's last input as feedback training context
+        input_ids = getattr(self.model, '_last_input_ids', None)
+        query_ids = None
+        if input_ids is not None:
+            ctx_len = min(input_ids.size(1), 30)
+            query_ids = input_ids[0, -ctx_len:].clone()
+
+        self._confusion_map.record(question_text, sigma, self._total_steps)
+        self._confusion_map.mark_asked(question_text)
+
+        question_data = {
+            'expert_id': expert_id,
+            'query_ids': query_ids,
+            'confused_text': question_text,
+            'sigma_aggregate': sigma,
+            'step': self._total_steps,
+        }
+
+        self.interaction.submit_question(question_data, self._total_steps)
+
+        # ── Real-time notification ──
+        # Print the question directly to the terminal so the user
+        # sees it immediately, without having to type something first.
+        # Then transition to AWAITING_ANSWER so the user's next input
+        # is treated as an answer (not a new query).
+        if self.interaction.state == 'question_pending':
+            print(f"\n  [MODEL ASKS] {question_text}")
+            print(f"  [sigma={sigma:.3f}, step={self._total_steps}]")
+            print(">>> ", end='', flush=True)  # re-display prompt
+            self.interaction.notify_question_displayed()
+
+    def _generate_emergent_question(self, expert_id, sigma):
+        """
+        The question EMERGES from the model's own confused state.
+
+        After processing the user's input, the model's hidden state
+        encodes its understanding.  When sigma is high, the model is
+        confused — it didn't fully grasp something.  We let the model
+        CONTINUE generating from its last state.  The confusion
+        naturally surfaces as uncertainty, doubt, or a question.
+
+        The internal dialectical signals influence the GENERATION
+        PROCESS rather than the seed token:
+
+        - Sigma controls temperature: higher sigma → higher
+          temperature → more diverse, uncertain expression.
+        - Contemplator gap (imagination vs. reality) controls
+          repetition penalty: larger gap → stronger penalty →
+          the model avoids repeating what it already said, forcing
+          it to explore new territory.
+        - Dialectical state provides no direct input to generation
+          but its existence (the model's internal history) is
+          already encoded in the weights through Hebbian learning.
+
+        This is consciousness expressing itself: the model's
+        internal confusion modulates its language generation, and
+        the question emerges naturally from the interaction between
+        what it knows and what it doesn't.
+        """
+        tok = self.model._decode_tokenizer
+        if tok is None:
+            return None
+
+        device = next(self.model.parameters()).device
+
+        # ── The seed is the model's last processed input ──
+        # The model's hidden state after processing this input
+        # encodes its understanding (or confusion).  Continuing
+        # from here lets the confusion surface naturally.
+        # 修复: 无对话时用当前状态向量作为 seed 兜底（不依赖用户先说话）
+        input_ids = getattr(self.model, '_last_input_ids', None)
+        if input_ids is None or input_ids.numel() == 0:
+            v_t = getattr(self, '_v_t', None)
+            if v_t is None:
+                print('[VERIFY] 无 _last_input_ids 且无状态，seed 兜底失败',
+                      file=sys.stderr)
+                return None
+            # 状态向量 → 最近 token 的近似 seed：解码前 8 维投影不可行，
+            # 改用对话模板引导模型从困惑状态表达
+            seed_text = '请告诉我你的困惑：'
+            seed_ids = tok(seed_text, return_tensors='pt')['input_ids']
+            input_ids = seed_ids.to(device)
+
+        # ── Internal signals modulate generation parameters ──
+        # Higher sigma → higher temperature → more uncertain expression
+        temp = 0.7 + 0.4 * min(sigma, 1.0)  # 0.7 ~ 1.1
+
+        # Contemplator gap → repetition penalty
+        # Large gap = big surprise = avoid repeating, explore new
+        rep_penalty = 1.3
+        if self._v_t is not None and self._u_next_input is not None:
+            with torch.no_grad():
+                v = self._v_t.reshape(-1).to(device)
+                u = self._u_next_input.reshape(-1).to(device)
+                if v.shape == u.shape:
+                    gap_mag = (u - v).norm().item()
+                    # Scale gap magnitude to penalty boost
+                    rep_penalty = 1.3 + min(gap_mag * 0.5, 0.5)
+
+        # ── Continue generation from confused state ──
+        # The model generates what it's "thinking about" after
+        # processing the input.  With high temperature (from sigma),
+        # the generation naturally expresses uncertainty.
+        seed = input_ids.to(device)
+
+        try:
+            with self.model._lock:
+                with torch.no_grad():
+                    generated = self.model.generate(
+                        seed,
+                        max_new_tokens=48,
+                        temperature=temp,
+                        repetition_penalty=rep_penalty,
+                        top_k=40, top_p=0.9,
+                    )
+
+            question_text = tok.decode(
+                generated[0, seed.size(1):],
+                skip_special_tokens=True,
+            ).strip()
+
+            # Clean chat-template artifacts
+            import re
+            question_text = re.sub(r'<[^>]+>', '', question_text)
+            question_text = re.sub(r'\s+', ' ', question_text).strip()
+
+            # Truncate at first sentence boundary (question or statement)
+            if len(question_text) > 150:
+                for end_ch in ('？', '?', '。', '.', '！', '!', '\n'):
+                    idx = question_text[:150].find(end_ch)
+                    if idx > 5:
+                        question_text = question_text[:idx + 1]
+                        break
+                if len(question_text) > 150:
+                    question_text = question_text[:150]
+
+            if len(question_text) >= 3:
+                return question_text
+            return None
+        except Exception:
+            return None
+
+    # ── Internal methods ──────────────────────────────────────────
+
+    def _maybe_timeout_question(self, max_steps=100000):
+        q = self.interaction.active_question
+        if q is None:
+            return
+        asked_step = q.get('step', 0)
+        if self._total_steps - asked_step > max_steps:
+            self.interaction.cancel_question()
+            print(f"\n  [TIMEOUT] Question canceled (step {asked_step} -> {self._total_steps})")
+
+    def _check_memory_consolidation(self):
+        """自发固化触发（每步检查，非程序性）。
+
+        salience 成熟（被反复聚焦）的记忆 → 单条蒸馏进 stable 专家。
+        sigma 仅调制强度（高=正在用于解决困惑→更强）。
+        """
+        mb = getattr(self.model, 'memory_bank', None)
+        if (mb is None
+                or not getattr(self.config, 'memory_salience_enabled', True)
+                or not getattr(self.config, 'memory_enabled', True)):
+            return
+        try:
+            thr = getattr(self.config, 'memory_salience_threshold', 3.0)
+            max_n = getattr(self.config, 'memory_consolidate_batch', 4)
+            hot = mb.get_hot_memories(threshold=thr, max_n=max_n)
+            if hot is None:
+                return
+            idx, vecs = hot  # idx [n], vecs [n, d]
+            # sigma 调制强度：sigma 0.5→1.0, 0.7→1.04, 0.3→0.96
+            sig = getattr(self, '_last_sigma', 0.5)
+            strength = 1.0 + getattr(
+                self.config, 'memory_sigma_strength', 0.2) * (sig - 0.5) * 2
+            from learn.consolidation import distill_memory_slots
+            distill_memory_slots(self.model, vecs.unsqueeze(1),
+                                 self.config, strength=strength)
+            cd = getattr(self.config, 'memory_consolidate_cooldown', 50)
+            mb.mark_consolidated(idx, cooldown=cd)
+        except Exception:
+            pass  # 自发固化是 best-effort，绝不破坏内循环
+
+    def _get_internal_mem_kv(self):
+        """内部循环的记忆 KV（L4 内容记忆）——缓存，轮次变化时重建。
+
+        内部循环同样能"想起"对话内容：1-token 状态的 Q
+        对历史对话 KV 做注意力检索，意识流受对话影响。
+        """
+        mb = getattr(self.model, 'memory_bank', None)
+        if mb is None or not getattr(self.config, 'memory_enabled', True):
+            return None
+        try:
+            n = len(mb.kvcache)
+            if self._mem_kv_n != n:
+                self._mem_kv_n = n
+                if n == 0:
+                    self._mem_kv = None
+                    return None
+                mem_kv = {}
+                dev = next(self.model.parameters()).device
+                for i, layer in enumerate(self.model.layers):
+                    kv = mb.get_kv(i)
+                    if kv is None:
+                        self._mem_kv = None
+                        return None
+                    k, v = kv
+                    if k.size(1) == 0:
+                        self._mem_kv = None
+                        return None
+                    mem_kv[i] = (k.unsqueeze(0).to(dev),
+                                 v.unsqueeze(0).to(dev))
+                self._mem_kv = mem_kv
+            return self._mem_kv
+        except Exception:
+            return None
+
+    def _get_state(self):
+        h = getattr(self.model, '_h_state', None)
+        if h is not None:
+            return h
+        return self.model.endosphere.get_latest()
+
+    def _init_state(self):
+        device = next(self.model.parameters()).device
+        sm = getattr(self.model, 'self_model', None)
+        if sm is not None:
+            h, z = sm.init_state(device=device)
+            self.model._h_state = h
+            self.model._z_state = z
+            return h
+        noise = torch.randn(1, self.config.d_model, device=device)
+        return noise.cpu()
+
+    def _imagine(self, v_t):
+        sm = getattr(self.model, 'self_model', None)
+        if sm is not None and self._h_t is not None and self._z_t is not None:
+            h_t = self._h_t.to(v_t.device)
+            z_t = self._z_t.to(v_t.device)
+            action = v_t.unsqueeze(0) if v_t.dim() == 1 else v_t
+            if action.dim() == 1:
+                action = action.unsqueeze(0)
+
+            h_next, z_mean, z_logvar = sm(h_t, z_t, action)
+            z_sample = sm.sample_z(z_mean, z_logvar)
+            u_next = sm.decode(z_sample, h_next).squeeze(0)
+
+            self.model._h_state = h_next.detach()
+            self.model._z_state = z_sample.detach()
+            self._h_t = h_next.detach()
+            self._z_t = z_sample.detach()
+
+            return u_next
+        return v_t
+
+    def _ema_blend(self, u, v):
+        alpha = self.config.ema_alpha
+        return alpha * u + (1 - alpha) * v
+
+    def _get_target(self, u_next_input):
+        sm = getattr(self.model, 'self_model', None)
+        if sm is not None and self._h_t is not None and self._z_t is not None:
+            h_t = self._h_t.to(u_next_input.device)
+            z_t = self._z_t.to(u_next_input.device)
+            with torch.no_grad():
+                o_pred = sm.decode(z_t, h_t)
+            return o_pred.squeeze(1)
+        with torch.no_grad():
+            return u_next_input
+
+    def _compute_loss(self, pred_emb, v_t):
+        sm = getattr(self.model, 'self_model', None)
+        if sm is None or self._h_t is None or self._z_t is None:
+            return self._fallback_loss(pred_emb, v_t)
+
+        device = pred_emb.device
+        h_t = self._h_t.to(device)
+        z_t = self._z_t.to(device)
+
+        if pred_emb.dim() == 3:
+            pred_emb = pred_emb.squeeze(1)
+
+        # Posterior: correct belief after observing actual output
+        z_post_mean, z_post_logvar = sm.observe_and_correct(h_t, pred_emb)
+
+        # Decode reconstruction from prior (detached z_t, h_t -> o_pred is constant)
+        # This acts as a fixed target for pred_emb, pushing the transformer
+        # to produce outputs that match the SelfModel's imagination.
+        o_pred = sm.decode(z_t, h_t).detach()
+
+        # 1) Imagination loss: pred_emb should match decoded imagination
+        loss_imagination = F.mse_loss(pred_emb, o_pred)
+
+        # 2) Curiosity loss: KL[Q(z|h,o) || P(z|h)]
+        # Gradient flows through pred_emb (via posterior) and through
+        # stored prior (z_mean, z_logvar from Stage A)
+        prior_z_mean = getattr(self, '_z_prior_mean', None)
+        prior_z_logvar = getattr(self, '_z_prior_logvar', None)
+        if prior_z_mean is not None and prior_z_logvar is not None:
+            loss_curiosity = sm.kl_divergence(
+                z_post_mean, z_post_logvar,
+                prior_z_mean.to(device), prior_z_logvar.to(device),
+            )
+            self._kl_value = loss_curiosity.item()
+        else:
+            loss_curiosity = torch.tensor(0.0, device=device)
+
+        # Note: stability loss is in _update_self_model (Stage C) where
+        # h_t and h_next both have gradients. Here they're detached.
+        # The old Lyapunov term (mean(h_t**2)*1e-4) was removed because
+        # h_t is detached here -- it contributed zero gradient and only
+        # inflated the reported loss, corrupting replay admission and
+        # critic targets.
+
+        total = (self._imagination_lambda * loss_imagination
+                 + self._curiosity_beta * loss_curiosity)
+        return total
+
+    def _fallback_loss(self, pred_emb, v_t):
+        """Fallback to original MSE loss when SelfModel is not available."""
+        if pred_emb.dim() == 3:
+            pred_emb = pred_emb.squeeze(1)
+        mse = F.mse_loss(pred_emb, v_t.unsqueeze(0) if v_t.dim() == 1 else v_t)
+        lyap_lambda = self.config.lyapunov_lambda
+        if lyap_lambda > 0:
+            lyap = F.mse_loss(pred_emb, torch.zeros_like(pred_emb))
+            mse = mse + lyap_lambda * lyap
+        return mse
+
+    def _update_self_model(self, u_next_input):
+        sm = getattr(self.model, 'self_model', None)
+        if sm is None or self._self_model_optimizer is None:
+            return
+        device = next(self.model.parameters()).device
+        u_in = u_next_input.to(device)
+        if u_in.dim() == 1:
+            u_in = u_in.unsqueeze(0).unsqueeze(0)
+        elif u_in.dim() == 2:
+            u_in = u_in.unsqueeze(0)
+
+        h_t = getattr(self.model, '_h_state', None)
+        z_t = getattr(self.model, '_z_state', None)
+        if h_t is None or z_t is None:
+            return
+        h_t = h_t.to(device)
+        z_t = z_t.to(device)
+
+        # Re-forward SelfModel
+        action = u_in.squeeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        h_next, z_mean, z_logvar = sm(h_t, z_t, action)
+        z_sample = sm.sample_z(z_mean, z_logvar)
+        u_decoded = sm.decode(z_sample, h_next).squeeze(0)
+        # C1 fix: forward_internal 只是"观察目标"——detach 输入，
+        # 防止 backward 把 SelfModel 训练梯度泄漏进 Transformer 参数 .grad
+        # （否则 49 步累积的 stale 梯度会在 consolidation 时污染 stable 专家）
+        pred = self.model.forward_internal(u_decoded.detach(),
+                                            h_state=h_next.detach(),
+                                            mem_kv=self._get_internal_mem_kv())
+        if pred.dim() == 3:
+            pred = pred.squeeze(1)
+
+        # Posterior + decode
+        z_post_mean, z_post_logvar = sm.observe_and_correct(h_next, pred)
+        o_pred = sm.decode(z_sample, h_next)
+
+        # Multi-objective loss:
+        # 1) Imagination: decoder reconstruction vs actual forward output
+        loss_imagination = F.mse_loss(o_pred, pred)
+
+        # 2) Curiosity: KL[Posterior || Prior] - how much did o_t change beliefs
+        loss_curiosity = sm.kl_divergence(
+            z_post_mean, z_post_logvar, z_mean, z_logvar
+        )
+
+        # 3) Stability: prevent h_t from jumping chaotically between steps
+        loss_stability = F.mse_loss(h_t, h_next)
+
+        loss = (self._imagination_lambda * loss_imagination
+                + self._curiosity_beta * loss_curiosity
+                + self._stability_lambda * loss_stability)
+
+        self._self_model_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(sm.parameters(), 1.0)
+        self._self_model_optimizer.step()
+
+    def _sigma_gamma(self):
+        """
+        Compute gamma for Hebbian update modulation.
+
+        Combines sigma-driven modulation with Critic TD-error for
+        better credit assignment.  The Critic learns to estimate
+        state value V(s); when TD-error is large (surprise), gamma
+        increases to drive larger updates.
+        """
+        sig = self._last_sigma
+        threshold = self.config.verify_threshold
+        base_gamma = min(max(sig / max(threshold, 0.01), 0.5), 2.0)
+
+        # Critic TD-error modulation
+        critic = getattr(self.model, 'critic', None)
+        if critic is not None and self._v_t is not None:
+            with torch.no_grad():
+                v_current = critic.get_normalized_v(self._v_t)
+                # TD-error proxy: |V(s) - 0| normalised.
+                # High |V| means the state is surprising → larger update.
+                td_mod = min(abs(v_current) / 2.0, 1.0)
+                base_gamma = base_gamma * (1.0 + 0.5 * td_mod)
+                base_gamma = min(base_gamma, 3.0)
+
+        return base_gamma
+
+    def _train_critic(self):
+        """
+        Train the Critic on pseudo-reward synthesized from internal signals.
+
+        TD(0) with one-step delay (M5 fix):
+          at step t we cache (state_{t-1}, r_{t-1}); at step t we train
+            V(s_{t-1}) -> r_{t-1} + gamma * V(s_t).detach()
+        i.e. the bootstrap always uses the NEXT state's value, never the
+        previous one.  First step after init has no pending pair -> no update.
+        """
+        critic = getattr(self.model, 'critic', None)
+        critic_opt = getattr(self.model, 'critic_optimizer', None)
+        if critic is None or critic_opt is None:
+            return
+        if self._v_t is None or self._loss_int is None:
+            return
+
+        from learn.critic import compute_pseudo_reward
+
+        loss_val = self._loss_int.item()
+        sigma = self._last_sigma
+        pseudo_r = compute_pseudo_reward(
+            loss_int=loss_val,
+            sigma_aggregate=sigma,
+        )
+
+        # ── 延迟 TD(0)：用缓存的上一步 (state, reward) 训练 ──
+        pending = getattr(self, '_critic_pending', None)
+        if pending is not None:
+            state_prev, r_prev = pending  # (s_{t-1}, r_{t-1})
+            gamma = getattr(self.config, 'gamma', 0.99)
+            # V(s_t) 作为 bootstrap 目标（当前状态 = s_{t-1} 的 next state）
+            with torch.no_grad():
+                v_next = critic(self._v_t).squeeze()   # V(s_t)
+            v_prev_pred = critic(state_prev).squeeze()  # V(s_{t-1})，可导
+            td_target = r_prev + gamma * v_next
+            critic_loss = F.smooth_l1_loss(v_prev_pred, td_target)
+            critic_opt.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+            critic_opt.step()
+
+        # 缓存当前 (state, r) 供下一步使用（s_{t-1} 视角）
+        self._critic_pending = (self._v_t.detach().clone(), pseudo_r)
+
+    def _mini_consolidate(self):
+        """
+        每 50 步：局部蒸馏（stable expert）+ 全局回放巩固。
+        全局回放从事后角度更新 Attention/Router/LMHead/RMSNorm/AttnRes，
+        让模型的基础设施慢慢适应 expert 的局部学习成果。
+        """
+        if len(self._replay_buffer) < 4:
+            return
+        replay = self._replay_buffer.sample(4)
+        if replay is None:
+            return
+        from learn.consolidation import mini_distill
+        mini_distill(
+            self.model, replay, self.config,
+            global_optimizer=self._global_optimizer,
+        )
+
+    def _major_consolidate(self):
+        """
+        每 500 步：完整巩固 + EWC 保护 + 全局回放。
+        """
+        if len(self._replay_buffer) < self.config.sleep_batch_size:
+            return
+        from learn.consolidation import major_sleep
+        major_sleep(
+            self.model, self._replay_buffer, self.config,
+            global_optimizer=self._global_optimizer,
+        )
+
+    def _rebuild_after_arch_change(self, change_type):
+        """
+        Rebuild training infrastructure after architecture self-modification.
+
+        - 'add_layer': rebuild global optimizer (new layer params not in it)
+                       and GradientManager (stale layer count)
+        - 'split'/'prune': router dims changed; no optimizer rebuild needed
+                       (router params are resized in-place), but Fisher
+                       protection from the previous major_sleep is stale.
+                       This is safe because ewc_penalty silently skips
+                       mismatched keys, and the next major_sleep recomputes
+                       Fisher fresh.
+        - 'replace': no structural change, just weight copy; nothing to do.
+        """
+        if change_type == 'replace':
+            return
+
+        if change_type == 'add_layer':
+            # Update layer count
+            self.config.n_layers = len(self.model.layers)
+            self.model.config.n_layers = len(self.model.layers)
+
+            # Rebuild GradientManager with new layer count
+            self._gradient_mgr = GradientManager(self.config.n_layers)
+
+        # For add_layer / split / prune: rebuild global optimizer
+        # because add_layer adds entirely new parameter tensors,
+        # and split/prune resize router weight matrices (new Parameter
+        # objects that the old optimizer doesn't track).
+        global_params = []
+        for name, p in self.model.named_parameters():
+            if any(k in name for k in
+                   ['attention', 'router', 'lm_head',
+                    'ln_f', 'ln1', 'ln2',
+                    'q_norm', 'k_norm', 'q_proj', 'kv_proj', 'o_proj',
+                    'attn_res', 'post_norm']):
+                if p.requires_grad:
+                    global_params.append(p)
+        if global_params:
+            self._global_optimizer = torch.optim.AdamW(
+                global_params, lr=1e-6, weight_decay=0.01,
+                betas=(0.9, 0.95),
+            )
+            self._global_param_count = len(global_params)
+            self._global_snapshot = [p.data.clone() for p in global_params]
+        else:
+            self._global_optimizer = None
+            self._global_param_count = 0
+            self._global_snapshot = None
