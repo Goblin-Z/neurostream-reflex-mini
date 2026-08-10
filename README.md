@@ -6,15 +6,11 @@
 
 ## Highlights
 
-- **Dual-loop architecture**: the outer loop (dialogue) and inner loop (stream of consciousness) share state and memory — essentially the same "memory → computation → new memory" self-referential cycle running at two scales
-- **Memory system v4 (L1–L4)**:
-  - L0: explicit history (template concatenation)
-  - L1: short-term semantics (dialogue injected into `h_t`)
-  - L2/L3: long-term semantics (AttnRes memory source + differentiable memory slots)
-  - L4: content memory (layered KV cache — attention reaches historical token representations directly, enabling verbatim recall)
-- **Spontaneous consolidation**: memory importance is quantified by model behavior (attention-weighted salience accumulation); memories are distilled into stable weights when mature — non-programmatic, no fixed step schedule
-- **Hebbian learning**: expert weights are strengthened by local gradients (momentum + activation gating + dual clipping), not global backprop
-- **Architecture self-modification**: expert split/prune/add-layer (safe after fixes, enabled by default at deployment)
+- **Dual-loop architecture**: an inner loop keeps "thinking" continuously (state evolution, Hebbian learning, consolidation), while the outer loop turns thoughts into dialogue — they share the same memory and state, so what the model "remembers" shapes what it says, and what it says becomes new memory
+- **Multi-level memory**: remembers recent conversation verbatim (via attention over historical representations), understands what the conversation is about (via internal state), and keeps long-term knowledge (via a learnable memory bank) — like working memory + episodic memory + semantic memory
+- **Spontaneous consolidation**: the more the model actually *uses* a memory (measured by its own attention), the more important it becomes — and when a memory matures, the model automatically distills it into its weights, without any fixed schedule
+- **Hebbian learning**: experts strengthen through local correlation ("neurons that fire together wire together"), not global backprop
+- **Architecture self-modification**: the model can split/prune/add experts over time as it learns
 
 ## Quick Start
 
@@ -31,26 +27,8 @@ python run_mini.py --checkpoint <ckpt.pt> --device cuda
 python chat_sft.py --checkpoint <ckpt.pt> --device cpu --prompt "中国的首都是"
 ```
 
-### Train (cloud / AutoDL)
-
-```bash
-# One-command pipeline (data gen → cleaning → SFT → KD → refine; idempotent, resumable)
-nohup bash scripts/run_pipeline.sh > pipeline.log 2>&1 &
-tail -f pipeline.log
-```
-
-### Memory fine-tuning (teach the model to *use* memory)
-
-```bash
-# 1. Generate long-range-reference multi-turn data (7 turns + cross-turn reference)
-python scripts/generate_qa.py --teacher <teacher> \
-  --output mt_memory_20k.jsonl --max-samples 20000 \
-  --mode multi-turn --memory-tune --device cuda
-
-# 2. Fine-tune (KV history genuinely participates in training)
-python train_memory.py --checkpoint <ckpt.pt> \
-  --data mt_memory_20k.jsonl --steps 3000 --lr 1e-5 --batch-size 4
-```
+> Training pipeline (pretrain/SFT/distill/memory fine-tuning) is kept private.
+> Contact the author if you need training code.
 
 ## Architecture
 
@@ -70,20 +48,19 @@ User input → [Outer Loop Pipeline] ──► Generate (with h_state + mem_kv)
 
 | Component | Description |
 |-----------|-------------|
-| `core/` | Model backbone (MoE/Attention/AttnRes/SelfModel/MemoryBank) |
-| `loop/` | Inner loop (Stage A-K stream of consciousness) |
-| `learn/` | Online learning (Hebbian/consolidation/Critic) |
+| `core/` | Model backbone (MoE/Attention/SelfModel/MemoryBank) |
+| `loop/` | Inner loop (stream of consciousness: Hebbian/consolidation) |
+| `learn/` | Online learning (Hebbian updates/Critic) |
 | `interaction/` | External interaction (dialogue/verification/feedback) |
-| `train/` | Training (pretrain/SFT/distill) |
-| `scripts/` | Data generation / pipeline |
+| `config/` | Model configuration |
 
 ## Model Spec
 
-- **Architecture**: 24-layer GQA + RoPE + SwiGLU MoE (4 stable + 2 plastic) + block Delta attention residuals
+- **Architecture**: 24-layer GQA + RoPE + SwiGLU MoE (4 stable + 2 plastic experts) + block Delta attention residuals
 - **Vocabulary**: Qwen2.5 (151936)
 - **Parameters**: 769M
 - **Training**: 15B tokens Chinese pretraining + teacher (Qwen2.5-1.5B-Instruct) QA/multi-turn distillation
-- **Memory**: MemoryBank (128 semantic slots + 4-round KV cache + salience-based spontaneous consolidation)
+- **Memory**: 128 learnable memory slots + 4-round KV conversation cache + attention-based spontaneous consolidation
 
 ## Deploy Command Reference
 

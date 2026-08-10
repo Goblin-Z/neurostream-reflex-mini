@@ -1,0 +1,19 @@
+﻿*.pt
+*.pth
+*.safetensors
+*.jsonl
+*.jsonl.gz
+*.gz
+__pycache__/
+*.pyc
+docs/
+final_verify.py
+verify_final.py
+verify_mini_v3.py
+*.log
+nohup.out
+
+# 训练管线（不公开：训练代码保留在本地）
+train/
+scripts/
+train_memory.py

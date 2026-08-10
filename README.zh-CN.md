@@ -6,15 +6,11 @@ English | [简体中文](README.zh-CN.md)
 
 ## 核心亮点
 
-- **双循环架构**：外循环（对话）与内循环（意识流）共享状态与记忆，本质是同一个"记忆→计算→新记忆"自指循环在两个尺度上运行
-- **记忆系统 v4（L1-L4）**：
-  - L0 显式历史（模板拼接）
-  - L1 短期语义（对话注入 `h_t`）
-  - L2/L3 长期语义（AttnRes 记忆 source + 可微语义槽）
-  - L4 内容记忆（分层 KV 缓存——注意力直达历史表示，可逐词复述）
-- **自发固化**：记忆的重要性由模型行为量化（注意力聚焦累积 salience），成熟即蒸馏进 stable 权重——非程序性、不依赖固定步数
-- **Hebbian 学习**：专家权重由局部梯度强化（动量 + 激活门 + 双 clip），非全局反向传播
-- **架构自修改**：专家分裂/裁剪/加层（修复后安全，部署默认开启）
+- **双循环架构**：内循环持续"思考"（状态演化、Hebbian 学习、记忆巩固），外循环把思考转化为对话——两者共享记忆与状态：模型"记得什么"影响它说什么，它说的话又成为新记忆
+- **多层记忆**：能逐词记住最近对话（注意力直达历史表示）、理解对话主题（内部状态）、长期保存知识（可学习记忆库）——类似工作记忆 + 情景记忆 + 语义记忆
+- **自发巩固**：记忆被模型**实际使用**得越多（由其自身注意力衡量）就越重要——记忆成熟时自动蒸馏进权重，无需任何固定计划
+- **Hebbian 学习**：专家通过局部关联强化（"一起放电的神经元连在一起"），非全局反向传播
+- **架构自修改**：模型随学习自动分裂/裁剪/新增专家
 
 ## 快速开始
 
@@ -31,26 +27,7 @@ python run_mini.py --checkpoint <ckpt.pt> --device cuda
 python chat_sft.py --checkpoint <ckpt.pt> --device cpu --prompt "中国的首都是"
 ```
 
-### 训练（云端 AutoDL）
-
-```bash
-# 一键全流程（数据生成 → 清洗 → SFT → KD → 精修，幂等可断点续跑）
-nohup bash scripts/run_pipeline.sh > pipeline.log 2>&1 &
-tail -f pipeline.log
-```
-
-### 记忆微调（教模型"使用记忆"）
-
-```bash
-# 1. 生成长程引用型多轮数据（7 轮 + 跨轮引用追问）
-python scripts/generate_qa.py --teacher <teacher> \
-  --output mt_memory_20k.jsonl --max-samples 20000 \
-  --mode multi-turn --memory-tune --device cuda
-
-# 2. 微调（KV 历史真实参与训练）
-python train_memory.py --checkpoint <ckpt.pt> \
-  --data mt_memory_20k.jsonl --steps 3000 --lr 1e-5 --batch-size 4
-```
+> 训练管线（pretrain/SFT/distill/记忆微调）保留在本地，未随本仓库公开。
 
 ## 架构
 
@@ -70,20 +47,19 @@ python train_memory.py --checkpoint <ckpt.pt> \
 
 | 组件 | 说明 |
 |------|------|
-| `core/` | 模型主干（MoE/Attention/AttnRes/SelfModel/MemoryBank） |
-| `loop/` | 内部循环（Stage A-K 意识流） |
-| `learn/` | 在线学习（Hebbian/consolidation/Critic） |
+| `core/` | 模型主干（MoE/Attention/SelfModel/MemoryBank） |
+| `loop/` | 内部循环（意识流：Hebbian/巩固） |
+| `learn/` | 在线学习（Hebbian 更新/Critic） |
 | `interaction/` | 外部交互（对话/求证/反馈） |
-| `train/` | 训练（pretrain/SFT/distill） |
-| `scripts/` | 数据生成/流水线 |
+| `config/` | 模型配置 |
 
 ## 模型规格
 
-- **架构**：24 层 GQA + RoPE + SwiGLU MoE（4 stable + 2 plastic）+ 块间 Delta 注意力残差
+- **架构**：24 层 GQA + RoPE + SwiGLU MoE（4 稳定 + 2 可塑专家）+ 块间 Delta 注意力残差
 - **词表**：Qwen2.5（151936）
 - **参数量**：769M
 - **训练**：15B tokens 中文预训练 + 教师（Qwen2.5-1.5B-Instruct）QA/多轮蒸馏
-- **记忆**：MemoryBank（128 语义槽 + 4 轮 KV 缓存 + salience 自发固化）
+- **记忆**：128 个可学习记忆槽 + 4 轮 KV 对话缓存 + 注意力驱动的自发巩固
 
 ## 部署命令速查
 
