@@ -6,11 +6,37 @@
 
 ## Highlights
 
-- **Dual-loop architecture**: an inner loop keeps "thinking" continuously (state evolution, Hebbian learning, consolidation), while the outer loop turns thoughts into dialogue — they share the same memory and state, so what the model "remembers" shapes what it says, and what it says becomes new memory
-- **Multi-level memory**: remembers recent conversation verbatim (via attention over historical representations), understands what the conversation is about (via internal state), and keeps long-term knowledge (via a learnable memory bank) — like working memory + episodic memory + semantic memory
-- **Spontaneous consolidation**: the more the model actually *uses* a memory (measured by its own attention), the more important it becomes — and when a memory matures, the model automatically distills it into its weights, without any fixed schedule
+### Why dual-loop?
+
+The model does not merely respond to input — it continuously *thinks* even when nobody is talking.
+
+- **Outer loop (interaction)**: turns input + memory + state into dialogue. This is the model's "action" layer — fast, responsive, grounded in the current conversation.
+- **Inner loop (consciousness)**: runs continuously in the background — evolving internal state, strengthening experts (Hebbian), consolidating memory, and evaluating its own uncertainty. This is the "reflection" layer — slow, self-referential, independent of external stimuli.
+
+Together they form a **self-referential cycle**: every computation changes the state; the new state determines the next computation. What the model remembers shapes what it thinks; what it thinks becomes new memory. The cycle is closed at two scales — a micro-cycle inside (state → think → new state) and a macro-cycle across interactions (converse → learn → remember → converse differently).
+
+### Proactive verification (knowing what it doesn't know)
+
+The model can **ask questions when it is confused**:
+
+- Its experts carry an internal uncertainty signal (sigma). When sigma exceeds a threshold, the model recognizes it is not sure — not by rule, but by its own internal state.
+- It then generates a clarification question from its confused state and asks the user.
+- Your answer becomes a learning signal (focal boost on the confused expert) — the model updates, sigma drops, and it stops asking (emergent cooldown: learning itself is the cooldown, no timers).
+- If a question remains unresolved (sigma stays high), it will ask again — genuine curiosity loop, not a script.
+
+This is a primitive form of **metacognition**: the model monitors its own uncertainty and acts on it, closing the "confusion → ask → learn → resolve" loop.
+
+### Multi-level memory
+
+- **Verbatim recent memory**: attention reaches historical token representations directly — the model can recall what was actually said, not just a summary
+- **Conversation gist**: internal state encodes what the conversation is about
+- **Long-term knowledge**: a learnable memory bank keeps semantic memories
+- **Spontaneous consolidation**: the more the model *uses* a memory (measured by its own attention), the more important it becomes — mature memories are distilled into weights automatically, no fixed schedule
+
+### Other highlights
+
 - **Hebbian learning**: experts strengthen through local correlation ("neurons that fire together wire together"), not global backprop
-- **Architecture self-modification**: the model can split/prune/add experts over time as it learns
+- **Architecture self-modification**: the model can split/prune/add experts as it learns
 
 ## Quick Start
 
@@ -33,18 +59,32 @@ python chat_sft.py --checkpoint <ckpt.pt> --device cpu --prompt "中国的首都
 ## Architecture
 
 ```
-User input → [Outer Loop Pipeline] ──► Generate (with h_state + mem_kv)
-              │                              │
-              ▼                              ▼
-      Dialogue → h_t + KV store        Online training (memory + state)
-              │                              │
-              ▼                              ▼
-       [Inner Loop InternalLoop] ◄───────────┘
-        Stage A-K (noise→SelfModel→Hebbian→consolidate→verify)
-              │  Memory (slots/KV/salience) blends with computation
-              ▼
-        New state + new memory → feeds next outer loop
+                        ┌──────────────────────────────────────────┐
+                        │              MEMORY SYSTEM                │
+                        │  verbatim (KV cache)  gist (h_t)  knowledge│
+                        │  (learnable slots)                        │
+                        └────▲────────────▲─────────────▲───────────┘
+                             │            │             │
+   OUTER LOOP (interaction)  │   writes   │   reads     │
+   ┌────────────┐  generate ┌┴───────┐    │             │
+   │ user input │───►───────│ THINK  │◄───┴─────────────┘
+   └────────────┘           └───┬────┘     (h_state + memory)
+                                │ new state / memory
+   INNER LOOP (consciousness)   ▼
+   ┌──────────────────────────────────────────────────────┐
+   │  every step (continuous, no external input needed):  │
+   │  A. take state → noise → imagine (SelfModel) → think │
+   │  B. Hebbian update (strengthen used experts)         │
+   │  C. world-model learning + critic value              │
+   │  D. write state → memory (KV/slots/dialectics)       │
+   │  E/F. consolidate (distill memory into weights)      │
+   │  H. proactive verification (high sigma → ask user)   │
+   │  memory participates in every computation step;      │
+   │  every step produces new memory for the next one     │
+   └──────────────────────────────────────────────────────┘
 ```
+
+**The loop is closed**: inner loop continuously evolves state/memory; outer loop reads that state to speak; speaking writes new memory back into the loop. One self-referential cycle at two scales.
 
 | Component | Description |
 |-----------|-------------|
