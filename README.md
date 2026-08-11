@@ -33,6 +33,17 @@ This is a primitive form of **metacognition**: the model monitors its own uncert
 - **Long-term knowledge**: a learnable memory bank keeps semantic memories
 - **Spontaneous consolidation**: the more the model *uses* a memory (measured by its own attention), the more important it becomes — mature memories are distilled into weights automatically, no fixed schedule
 
+### Learn while deployed
+
+The model keeps learning *during deployment* — every conversation is also a training step:
+
+- **Online training**: after each reply, the model fine-tunes on the conversation (with memory and state engaged) — the more you talk, the better it gets at *this* kind of dialogue
+- **Hebbian updates**: experts strengthen in real time on every internal step
+- **Spontaneous consolidation**: frequently used memories are distilled into weights automatically
+- **Architecture self-modification**: expert split/prune/add-layer happen while running
+
+It is a system that learns from use — not a frozen artifact.
+
 ### Other highlights
 
 - **Hebbian learning**: experts strengthen through local correlation ("neurons that fire together wire together"), not global backprop
@@ -52,9 +63,6 @@ python run_mini.py --checkpoint <ckpt.pt> --device cuda
 ```bash
 python chat_sft.py --checkpoint <ckpt.pt> --device cpu --prompt "中国的首都是"
 ```
-
-> Training pipeline (pretrain/SFT/distill/memory fine-tuning) is kept private.
-> Contact the author if you need training code.
 
 ## Architecture
 
