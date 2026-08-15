@@ -7,7 +7,9 @@ from learn.hebbian_update import focal_update
 
 class DigestionQueue:
     """
-    Async digestion queue for high-perplexity inputs.
+    [未接入 - 预留模块] Async digestion queue for high-perplexity inputs.
+    当前没有任何调用方（文档宣称的 Stage E 消化队列未接入内循环），
+    保留作为后续"高困惑输入消化"设计的实现参考。
 
     When the external loop encounters input it's uncertain about
     (high perplexity or high sigma), it enqueues the input for

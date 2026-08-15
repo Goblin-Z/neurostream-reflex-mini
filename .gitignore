@@ -1,19 +1,13 @@
-﻿*.pt
+# 大文件/中间产物一律不入库（checkpoint/数据/日志）
+*.pt
 *.pth
 *.safetensors
 *.jsonl
 *.jsonl.gz
 *.gz
-__pycache__/
-*.pyc
-docs/
-final_verify.py
-verify_final.py
-verify_mini_v3.py
 *.log
 nohup.out
 
-# 训练管线（不公开：训练代码保留在本地）
-train/
-scripts/
-train_memory.py
+# Python
+__pycache__/
+*.pyc

@@ -3,13 +3,14 @@ ReflexMini 部署运行脚本（完整模式：内部循环全开）。
 
 所有训练阶段关闭的模块都会激活：
   - InternalLoop（SelfModel 状态前向 + Hebbian 更新 + Critic + 辩证缓冲 + 巩固）
-  - 架构自修改默认关闭（已知 bug：split/prune 后 forward 崩溃），
+  - 架构自修改默认关闭（无对照实验前不改写已训练权重），
     可用 --arch-self-mod 显式开启（风险自负）。
 
 用法:
   python run_mini.py --checkpoint /root/autodl-tmp/checkpoints/reflex-mini/sft_final.pt
   python run_mini.py --checkpoint ... --device cuda --tokenizer /root/autodl-tmp/data/qwen2.5-0.5b
   python run_mini.py --checkpoint ... --no-internal-loop   # 关闭内循环（纯推理对照）
+  python run_mini.py --checkpoint ... --arch-self-mod      # 显式开启架构自修改
 """
 import os, sys, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,8 +32,8 @@ def main():
     p.add_argument('--tokenizer', default='/root/autodl-tmp/data/qwen2.5-0.5b')
     p.add_argument('--no-internal-loop', action='store_true',
                    help='关闭内循环（对照：纯生成）')
-    p.add_argument('--no-arch-self-mod', action='store_true',
-                   help='关闭架构自修改（C2 已修复，默认开启）')
+    p.add_argument('--arch-self-mod', action='store_true',
+                   help='显式开启架构自修改（默认关闭，风险自负）')
     p.add_argument('--verify-threshold', type=float, default=None,
                    help='主动求证 sigma 阈值（默认 config 0.5；调低更易触发）')
     args = p.parse_args()
@@ -42,12 +43,12 @@ def main():
         device = 'cpu'
 
     config = ReflexMiniConfig()
-    if args.no_arch_self_mod:
-        config.arch_self_mod_enabled = False
-        print('[INFO] 架构自修改已关闭 (--no-arch-self-mod)')
+    if args.arch_self_mod:
+        config.arch_self_mod_enabled = True
+        print('[INFO] 架构自修改已开启（专家分裂/裁剪/加层，风险自负）')
     else:
-        # C2 已修复（专家增减/加层不再崩溃）——默认开启架构自修改
-        print('[INFO] 架构自修改已开启（专家分裂/裁剪/加层，C2 修复后安全）')
+        config.arch_self_mod_enabled = False
+        print('[INFO] 架构自修改默认关闭（可用 --arch-self-mod 开启）')
     if args.verify_threshold is not None:
         config.verify_threshold = args.verify_threshold
         print(f'[INFO] verify_threshold 调为 {args.verify_threshold} '
@@ -62,13 +63,11 @@ def main():
     model = ReflexModel(config)
     ck = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     model.load_state_dict(ck['model_state_dict'], strict=False)
-    # post_norm 放大：现有 checkpoint 的 AttnRes 权重（~0.005）几乎无声，
-    # 统一设为目标尺度让记忆 source 真实影响输出（记忆微调前提）
+    # AttnRes post_norm：不再强制覆写——部署与 checkpoint 训练行为保持一致。
+    # （记忆微调 train_memory.py 会单独处理放大，作为记忆利用训练的前提）
     if model.attn_res is not None:
-        pn_init = getattr(config, 'attnres_postnorm_init', 0.1)
-        for m in model.attn_res.modules_list:
-            m.post_norm.weight.data.fill_(pn_init)
-        print(f'[INFO] AttnRes post_norm 已放大至 {pn_init}（记忆真实影响输出）')
+        pn = [m.post_norm.weight.mean().item() for m in model.attn_res.modules_list]
+        print(f'[INFO] AttnRes post_norm 保持 checkpoint 尺度 (mean={sum(pn)/len(pn):.4f})')
     model._decode_tokenizer = tok
     model.to(device)
     model.eval()
@@ -123,9 +122,13 @@ def main():
                   f'state: {mgr_stats.get("state")}, '
                   f'can_ask: {mgr_stats.get("can_ask")}, '
                   f'asked: {mgr_stats.get("total_asked", 0)}')
+            # 状态门控生效观测（v4 §七·八：从"无影响"逐步到"带想法"）
+            print(f'  h_to_bias(max): {internal_loop.h_to_bias_drift:.4f}, '
+                  f'global_drift: {internal_loop.global_drift:.4f}')
             # 显示内循环最近被吞掉的异常（_loop 的 except 只记录不打印）
-            errs = [h.get('error') for h in internal_loop._loss_history
-                    if 'error' in h][-3:]
+            with internal_loop._stats_lock:
+                errs = [h.get('error') for h in internal_loop._loss_history
+                        if 'error' in h][-3:]
             if errs:
                 print('  [ERRORS] 最近内循环异常（静默吞掉）:')
                 for e in errs:

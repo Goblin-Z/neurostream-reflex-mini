@@ -6,7 +6,9 @@ from config.model_config import ReflexConfig
 
 class SelfPlayGenerator:
     """
-    Curriculum-based self-play generation.
+    [未接入 - 预留模块] Curriculum-based self-play generation.
+    当前没有任何调用方（文档宣称的 Stage H 自对弈未接入内循环），
+    保留作为后续"课程自对弈"设计的实现参考。
 
     The model finds its own confused spans, generates questions about them,
     answers them, and filters high-quality QA pairs for additional training.

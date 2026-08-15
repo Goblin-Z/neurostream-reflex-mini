@@ -55,6 +55,7 @@ class InternalLoop:
         self._step_count = 0
         self._total_steps = 0
         self._loss_history = []
+        self._stats_lock = threading.Lock()  # 保护 _loss_history 跨线程读写（P2-1）
 
         self._gradient_mgr = GradientManager(config.n_layers)
         self._replay_buffer = PriorityReplayBuffer(
@@ -216,9 +217,24 @@ class InternalLoop:
     def global_param_count(self):
         return self._global_param_count
 
+    @property
+    def h_to_bias_drift(self):
+        """Router 状态门控（h_to_bias_weight）当前最大绝对值——观测其是否随
+        在线训练逐步生效（v4 §七·八：从"无影响"到"带想法"）。"""
+        m = 0.0
+        with self.model._lock:
+            for layer in self.model.layers:
+                v = layer.router.h_to_bias_weight.abs().max().item()
+                if v > m:
+                    m = v
+        return m
+
     # ── Internal loop ─────────────────────────────────────────────
 
     def _loop(self):
+        # 忙循环限速：每步后休眠 internal_step_delay_ms（默认 5ms），
+        # 保持"持续思考"同时避免无节流烧算力（internal_steps_per_cycle 旧语义废弃）
+        delay = max(0.0, getattr(self.config, 'internal_step_delay_ms', 5.0)) / 1000.0
         while self._running:
             self._event.wait()
             try:
@@ -227,12 +243,15 @@ class InternalLoop:
                 self.model._internal_step_count = self._total_steps
             except Exception as e:
                 import traceback
-                self._loss_history.append({'error': str(e)})
+                with self._stats_lock:
+                    self._loss_history.append({'error': str(e)})
                 # 打印完整 traceback 到 stderr（部署诊断用）
                 print(f'\n[INTERNAL LOOP ERROR step={self._total_steps}] '
                       f'{type(e).__name__}: {e}', file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
                 print('', file=sys.stderr)
+            if delay > 0:
+                time.sleep(delay)
 
     def _execute_step(self):
         self._step_done.clear()
@@ -359,20 +378,20 @@ class InternalLoop:
                 if change is not None:
                     self._rebuild_after_arch_change(change)
 
-        self.interaction.update_sigma(self._last_sigma)
+        self.interaction.update_sigma(self._last_sigma, self._total_steps)
 
         # ── Stage D: Push to dialectical buffer ──
-        # Both low-loss (coherent) and high-loss (confused) states enter
-        # replay, distinguished by priority.  Confused states get high
-        # novelty so they are sampled more often during consolidation --
-        # this lets the system distil resolved confusion into stable experts.
+        # P0-C 修复（审计 v2）：priority 与 loss/KL 解耦——
+        # 高 coherence（稳定知识）状态优先进入巩固采样，困惑状态保留 0.5 下限。
+        # 避免 KL 主导 priority 导致蒸馏偏向困惑、stable 专家被"困惑"污染。
         loss_val = self._loss_int.item()
         coherence = 1.0 - math.tanh(loss_val)
-        novelty = 1.0 - coherence  # high for confused states
+        priority = 0.5 + 0.5 * coherence  # [0.5, 1.0]，稳定知识优先，困惑不饿死
         self._replay_buffer.add(
             self._u_next_input.squeeze(0).detach(),
             loss=loss_val,
-            novelty=novelty,
+            novelty=priority,
+            priority=priority,
         )
 
         prev_stats = self.dialectical_stats
@@ -398,26 +417,28 @@ class InternalLoop:
                 print(">>> ", end='', flush=True)
 
         self._step_count += 1
-        self._loss_history.append({
-            'step': self._total_steps,
-            'loss': self._loss_int.item(),
-            'sigma': self._last_sigma,
-            'noise': self._noise_scheduler.current_noise,
-            'kl': self._kl_value,
-        })
-        if len(self._loss_history) > 10000:
-            self._loss_history = self._loss_history[-5000:]
+        with self._stats_lock:
+            self._loss_history.append({
+                'step': self._total_steps,
+                'loss': self._loss_int.item(),
+                'sigma': self._last_sigma,
+                'noise': self._noise_scheduler.current_noise,
+                'kl': self._kl_value,
+            })
+            if len(self._loss_history) > 10000:
+                self._loss_history = self._loss_history[-5000:]
 
         # ── Stage G: Fluid expert role evaluation ──
         if self._step_count % 100 == 0:
             adjustments = self._fluid_roles.evaluate(self.model, self._total_steps)
             if adjustments:
-                for adj in adjustments:
-                    self._loss_history.append({
-                        'step': self._total_steps,
-                        'event': 'role_transition',
-                        **adj,
-                    })
+                with self._stats_lock:
+                    for adj in adjustments:
+                        self._loss_history.append({
+                            'step': self._total_steps,
+                            'event': 'role_transition',
+                            **adj,
+                        })
 
         # ── Stage H: Coordinated verification generation ──
         if self._step_count % 20 == 0:
@@ -791,6 +812,16 @@ class InternalLoop:
 
         total = (self._imagination_lambda * loss_imagination
                  + self._curiosity_beta * loss_curiosity)
+
+        # P1-4 修复：内循环梯度接地——想象输出与最近对话 embedding 对齐。
+        # 让意识流的梯度源不纯是自指（SelfModel↔Transformer 互锁），
+        # 而是扎根于用户真实输入（外部困惑源），Hebbian 更新方向获得外部锚点。
+        dialog_emb = getattr(self.model, '_last_dialog_emb', None)
+        grounded_w = getattr(self.config, 'grounded_weight', 0.0)
+        if dialog_emb is not None and grounded_w > 0:
+            total = total + grounded_w * F.mse_loss(
+                pred_emb, dialog_emb.to(pred_emb.device).detach()
+            )
         return total
 
     def _fallback_loss(self, pred_emb, v_t):

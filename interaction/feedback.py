@@ -86,7 +86,9 @@ class StructuredFeedback:
             # Normalize alignment to [0, 1], 0 = unrelated, 1 = highly aligned
             alignment = (alignment + 1.0) / 2.0
 
-            if alignment < 0.3:
+            # P2-4: 阈值配置化（0.3→0.2，语义相关但措辞不同的有效反馈不再被丢弃）
+            align_thr = getattr(self.config, 'feedback_alignment_threshold', 0.2)
+            if alignment < align_thr:
                 return {'reward': reward, 'focal_boost': None}
 
             expert_sigma = expert.avg_uncertainty

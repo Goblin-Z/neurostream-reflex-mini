@@ -41,6 +41,7 @@ class InteractionManager:
         self._state = self.IDLE
         self._lock = threading.RLock()
         self._active_question = None
+        self._config = config  # 保存引用（warmup 冷却配置）
 
         # Session limits (soft caps, not hard cooldowns)
         self._questions_this_session = 0
@@ -54,6 +55,14 @@ class InteractionManager:
         # 冷却结束后完全按 sigma 判断——疑问未解决（sigma 仍高）可追问 ✓
         self._ask_cooldown = 0
         self._ask_cooldown_max = 50
+        # 部署初期保守冷却（审计 v2 P1-5）：sigma 未校准前的 warmup 期，
+        # 距上次提问不足 warmup_cooldown 步则不提问，防随机打断
+        self._current_step = 0
+        self._last_question_step = None
+        self._verify_warmup_steps = getattr(
+            config, 'verify_warmup_steps', 500) if config else 500
+        self._verify_warmup_cooldown = getattr(
+            config, 'verify_warmup_cooldown', 50) if config else 50
 
         # Stats
         self._total_questions_asked = 0
@@ -96,17 +105,28 @@ class InteractionManager:
         with self._lock:
             if self._ask_cooldown > 0:
                 return False
+            # warmup 期保守冷却（P1-5）：部署初期 sigma 未校准，
+            # 提问间隔受 verify_warmup_cooldown 约束，防随机打断
+            if (self._current_step < self._verify_warmup_steps
+                    and self._last_question_step is not None
+                    and (self._current_step - self._last_question_step)
+                    < self._verify_warmup_cooldown):
+                return False
             return (self._state == self.IDLE
                     and self._questions_this_session < self._max_questions_per_session
                     and self._current_model_sigma > self._sigma_threshold)
 
-    def update_sigma(self, sigma):
+    def update_sigma(self, sigma, step=None):
         """
         Called by the internal loop after each forward pass.
         Updates the model's current uncertainty level.
         """
         with self._lock:
             self._current_model_sigma = sigma
+            if step is not None:
+                self._current_step = step
+            else:
+                self._current_step += 1
             if self._ask_cooldown > 0:
                 self._ask_cooldown -= 1  # 冷却按内循环步数递减
 
@@ -127,6 +147,8 @@ class InteractionManager:
             self._total_questions_asked += 1
             self._questions_this_session += 1
             self._ask_cooldown = self._ask_cooldown_max  # 防抖动冷却
+            if current_step is not None:
+                self._last_question_step = current_step
             return True
 
     def notify_question_displayed(self):

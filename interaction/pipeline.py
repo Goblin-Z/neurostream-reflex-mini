@@ -149,6 +149,9 @@ class ReflexPipeline:
                 # RISK-3: 归一化对话向量——防 embedding 量级污染 GRU 状态
                 emb_norm = emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
                 emb = emb / emb_norm * (self.config.d_model ** 0.5)
+                # P1-4: 保存最近对话 embedding——内循环 loss 的 grounded 锚点
+                # （想象输出与对话语义对齐，Hebbian 梯度获得外部方向）
+                self.model._last_dialog_emb = emb[0].detach()
                 alpha = getattr(self.config, 'dialog_memory_alpha', 0.3)
                 new_h = (alpha * emb + (1 - alpha) * h.to(emb.device))
                 self.model._h_state = new_h.detach()

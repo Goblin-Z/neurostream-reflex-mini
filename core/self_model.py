@@ -92,7 +92,12 @@ class MoEPrior(nn.Module):
 
         # Weighted combination (moment matching)
         mean = sum(w.unsqueeze(-1) * m for w, m in zip(weights.unbind(dim=-1), means))
-        var = sum(w.unsqueeze(-1) * torch.exp(lv.clamp(SelfModel.LOGVAR_MIN, SelfModel.LOGVAR_MAX)) for w, lv in zip(weights.unbind(dim=-1), logvars))
+        # 修复：矩匹配补全跨组件方差项（law of total variance）——
+        # var = Σ w_i·(σ_i² + μ_i²) − μ²，否则混合方差被低估导致 KL 失真
+        var = sum(
+            w.unsqueeze(-1) * (torch.exp(lv.clamp(SelfModel.LOGVAR_MIN, SelfModel.LOGVAR_MAX)) + m ** 2)
+            for w, lv, m in zip(weights.unbind(dim=-1), logvars, means)
+        ) - mean ** 2
         logvar = torch.log(var.clamp(min=1e-6, max=SelfModel.VAR_MAX))
 
         return mean, logvar, weights
@@ -137,7 +142,11 @@ class MoEPosterior(nn.Module):
             logvars.append(lv)
 
         mean = sum(w.unsqueeze(-1) * m for w, m in zip(weights.unbind(dim=-1), means))
-        var = sum(w.unsqueeze(-1) * torch.exp(lv.clamp(SelfModel.LOGVAR_MIN, SelfModel.LOGVAR_MAX)) for w, lv in zip(weights.unbind(dim=-1), logvars))
+        # 修复：矩匹配补全跨组件方差项（law of total variance）
+        var = sum(
+            w.unsqueeze(-1) * (torch.exp(lv.clamp(SelfModel.LOGVAR_MIN, SelfModel.LOGVAR_MAX)) + m ** 2)
+            for w, lv, m in zip(weights.unbind(dim=-1), logvars, means)
+        ) - mean ** 2
         logvar = torch.log(var.clamp(min=1e-6, max=SelfModel.VAR_MAX))
 
         return mean, logvar, weights

@@ -69,8 +69,10 @@ class ReflexMoELayer(nn.Module):
         n_active = len(self.all_experts)
         expert_sigmas = torch.zeros(n_active, device=x_flat.device)
         per_token_sigma = torch.zeros(x_flat.size(0), device=x_flat.device)
-        # Differentiable sigma for calibration training (not detached)
-        learnable_sigmas = torch.zeros(n_active, device=x_flat.device)
+        # Differentiable sigma for calibration training (not detached)。
+        # 修复：不再用 index_put_ 写零张量（in-place 断图），
+        # 收集每专家 mean 后 stack——calibration 梯度真实回流 uncertainty_head。
+        learnable_sigma_list = []
 
         for i, expert in enumerate(self.all_experts):
             rows, cols = (top_idx == i).nonzero(as_tuple=True)
@@ -83,7 +85,7 @@ class ReflexMoELayer(nn.Module):
             weight = top_w[rows, cols].unsqueeze(-1)
             expert_out, expert_sigma = expert(token_input, save_hebbian_buffers)
             expert_sigmas[i] = expert_sigma.mean().detach()
-            learnable_sigmas[i] = expert_sigma.mean()  # differentiable
+            learnable_sigma_list.append(expert_sigma.mean())  # differentiable
             per_token_sigma[rows] += (
                 weight.squeeze(-1) * expert_sigma.squeeze(-1)
             ).detach()
@@ -98,7 +100,10 @@ class ReflexMoELayer(nn.Module):
         per_token_sigma = per_token_sigma.view(batch, seq)
 
         # Store learnable sigma for calibration loss
-        self._learnable_sigmas = learnable_sigmas
+        if learnable_sigma_list:
+            self._learnable_sigmas = torch.stack(learnable_sigma_list).mean()
+        else:
+            self._learnable_sigmas = None
 
         return (output, top_w, top_idx, logits,
                 expert_sigmas, sigma_agg, per_token_sigma)
@@ -527,7 +532,6 @@ class ReflexModel(nn.Module):
             if aux is not None:
                 total = aux if total is None else total + aux
         return total
-        return None
 
     def set_stable_requires_grad(self, rg):
         for e in self.get_stable_experts():

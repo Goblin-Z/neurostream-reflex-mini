@@ -18,14 +18,15 @@ class PriorityReplayBuffer:
         self.priorities = []
         self._lock = threading.RLock()
 
-    def add(self, embedding, loss, novelty, input_ids=None):
+    def add(self, embedding, loss, novelty, priority=None, input_ids=None):
         item = {
             'embedding': embedding.detach().clone().cpu(),
             'input_ids': input_ids.detach().clone().cpu() if input_ids is not None else None,
             'loss': loss,
             'novelty': novelty,
         }
-        priority = novelty + abs(loss)
+        if priority is None:
+            priority = novelty + abs(loss)
         with self._lock:
             if len(self.buffer) >= self.capacity:
                 min_idx = min(range(len(self.priorities)),

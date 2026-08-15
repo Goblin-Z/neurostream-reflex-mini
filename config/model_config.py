@@ -61,6 +61,10 @@ class ReflexConfig:
     verify_min_interval: int = 10
     verify_query_max_tokens: int = 30
     max_cognitive_depth: int = 5
+    # 部署初期保守冷却（审计 v2 P1-5）：前 verify_warmup_steps 步内，
+    # 距上次提问不足 verify_warmup_cooldown 步则不提问，防止 sigma 未校准时的随机提问
+    verify_warmup_steps: int = 500
+    verify_warmup_cooldown: int = 50
 
     # ── SelfModel (v2 Contemplator upgrade) ──
     self_model_enabled: bool = True
@@ -73,6 +77,9 @@ class ReflexConfig:
     curiosity_beta: float = 0.1
     imagination_lambda: float = 1.0
     stability_lambda: float = 0.01
+    # P1-4: 内循环梯度接地——想象输出与最近对话 embedding 的 MSE 权重
+    # （让意识流扎根于真实对话，而非纯自指）
+    grounded_weight: float = 0.1
 
     # ── Consolidation ──
     sleep_lr: float = 1e-5
@@ -84,7 +91,8 @@ class ReflexConfig:
     plastic_reg_strength: float = 1e-6
 
     # ── Architecture self-modification ──
-    arch_self_mod_enabled: bool = True
+    # 默认关闭（无对照实验前不改写已训练权重）；部署可用 --arch-self-mod 显式开启
+    arch_self_mod_enabled: bool = False
     arch_replace_reward_threshold: float = 0.2
     arch_split_load_ratio: float = 3.0
     arch_add_layer_improvement_threshold: float = 0.01
@@ -105,7 +113,8 @@ class ReflexConfig:
     feedback_gamma_modulation_strength: float = 0.3
     feedback_alignment_weight: float = 0.5  # deprecated (unused in feedback.py)
     feedback_align_loss_weight: float = 0.2  # alignment loss weight (CE complement)
-    sigma_calibration_weight: float = 0.05  # sigma calibration loss weight
+    sigma_calibration_weight: float = 0.2  # sigma calibration loss weight (0.05→0.2，强化校准)
+    feedback_alignment_threshold: float = 0.2  # 反馈对齐最低余弦相似度（原硬编码 0.3 过高，P2-4）
 
     # ── Sampling (generation) ──
     sampling_temperature: float = 0.8
@@ -118,6 +127,9 @@ class ReflexConfig:
 
     # ── Others ──
     internal_steps_per_cycle: int = 1000
+    # 内循环每步后的休眠毫秒数（防忙循环烧算力；0=不限制）。
+    # 默认 5ms ≈ 200 steps/s 上限，保持"持续思考"同时释放 CPU/GPU
+    internal_step_delay_ms: float = 5.0
     internal_loss_clip: float = 10.0
     endosphere_capacity: int = 1024
     replay_capacity: int = 10000

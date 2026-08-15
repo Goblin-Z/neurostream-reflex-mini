@@ -6,7 +6,9 @@ from config.model_config import ReflexConfig
 
 class ReflexRewardModel:
     """
-    Multi-dimensional reward model for self-play quality filtering.
+    [未接入 - 预留模块] Multi-dimensional reward model for self-play quality filtering.
+    当前仅被未接入的 improve/self_play.py 引用（无调用方），
+    保留作为后续自对弈/数据筛选的奖励模型实现参考。
 
     Combines: self-consistency, perplexity, diversity, and length.
     """

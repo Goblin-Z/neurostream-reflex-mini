@@ -99,10 +99,12 @@ class Expert(nn.Module):
         out = self.w_down(h)        # [*, d_model]
         sigma = torch.sigmoid(self.uncertainty_head(h))
         self._output = out.detach() if not save_hebbian_buffers else out
-        self.uncertainty_ema.mul_(0.9).add_(sigma.mean().detach(), alpha=0.1)
-        self.activation_ema.mul_(0.9).add_(
-            torch.norm(h, p=2, dim=-1).mean().detach(), alpha=0.1
-        )
+        # EMA 只在训练模式更新（修复：eval 生成也污染 avg_uncertainty 的问题）
+        if self.training:
+            self.uncertainty_ema.mul_(0.9).add_(sigma.mean().detach(), alpha=0.1)
+            self.activation_ema.mul_(0.9).add_(
+                torch.norm(h, p=2, dim=-1).mean().detach(), alpha=0.1
+            )
         return out, sigma
 
     def update_local(self, grad_y, lr, gamma=1.0):

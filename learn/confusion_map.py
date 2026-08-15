@@ -1,5 +1,6 @@
 import time
 import hashlib
+import re
 
 
 class ConfusionMap:
@@ -10,7 +11,7 @@ class ConfusionMap:
     the ConfusionMap tracks "I've been confused about 量子力学 for 5
     consecutive turns" — a meta-cognitive signal.
 
-    Each confused text span is hashed into a concept key. The map tracks:
+    Each confused text span is grouped into a concept key. The map tracks:
       - How many times this concept has been confusing
       - Average sigma when this concept appears
       - How long ago it was last seen
@@ -22,14 +23,18 @@ class ConfusionMap:
       3. Build a "knowledge gap" map over time
     """
 
-    def __init__(self, resolution_threshold=3):
+    def __init__(self, resolution_threshold=3, group_jaccard=0.5):
         """
         Args:
             resolution_threshold: after this many consecutive low-sigma
                                   observations, a concept is marked resolved.
+            group_jaccard: 字符 2-gram Jaccard 相似度阈值——同概念不同措辞
+                           （"量子力学是什么" vs "什么是量子力学"）聚合为一组。
+                           修复：原 MD5 精确哈希导致同概念永不累积（WIKI 4.17）。
         """
         self._map = {}  # concept_hash → ConceptEntry
         self._resolution_threshold = resolution_threshold
+        self._group_jaccard = group_jaccard
         self._total_concepts = 0
         self._resolved_concepts = 0
 
@@ -45,9 +50,9 @@ class ConfusionMap:
         if not confused_text or len(confused_text.strip()) < 1:
             return
 
-        concept_hash = self._hash_concept(confused_text)
-
-        if concept_hash not in self._map:
+        concept_hash = self._find_group(confused_text)
+        if concept_hash is None:
+            concept_hash = self._hash_concept(confused_text)
             self._map[concept_hash] = {
                 'text': confused_text,
                 'count': 0,
@@ -78,7 +83,9 @@ class ConfusionMap:
 
     def mark_asked(self, confused_text):
         """Mark a concept as having been asked about."""
-        concept_hash = self._hash_concept(confused_text)
+        concept_hash = self._find_group(confused_text)
+        if concept_hash is None:
+            concept_hash = self._hash_concept(confused_text)
         if concept_hash in self._map:
             self._map[concept_hash]['asked_about'] = True
 
@@ -129,9 +136,35 @@ class ConfusionMap:
         """
         Hash a text span into a concept key.
 
-        Uses a simple normalization (lowercase, strip whitespace)
-        and MD5 hash. In a full implementation, this could use
-        embedding similarity to group semantically related spans.
+        Uses a simple normalization (lowercase, strip whitespace/punctuation)
+        and MD5 hash.  Semantic grouping is handled by _find_group (2-gram
+        Jaccard), so the hash itself only needs to be deterministic.
         """
-        normalized = text.lower().strip()[:50]
+        normalized = re.sub(r'[^\u4e00-\u9fffA-Za-z0-9]', '', text.lower())[:50]
         return hashlib.md5(normalized.encode('utf-8')).hexdigest()[:12]
+
+    def _grams(self, text):
+        """字符 2-gram 集合（归一化后）。"""
+        n = re.sub(r'[^\u4e00-\u9fffA-Za-z0-9]', '', text.lower())[:60]
+        return set(n[i:i + 2] for i in range(len(n) - 1))
+
+    def _find_group(self, text):
+        """
+        语义分组：与已有概念的代表文本做 2-gram Jaccard 相似度，
+        超过 _group_jaccard（默认 0.5）即归入该概念——同概念不同措辞聚合。
+        返回已有 concept_hash 或 None（新建）。
+        """
+        g = self._grams(text)
+        if not g:
+            return None
+        best_key, best_j = None, 0.0
+        for h, e in self._map.items():
+            eg = self._grams(e.get('text', ''))
+            if not eg:
+                continue
+            j = len(g & eg) / max(1, len(g | eg))
+            if j > best_j:
+                best_j, best_key = j, h
+        if best_key is not None and best_j >= self._group_jaccard:
+            return best_key
+        return None
