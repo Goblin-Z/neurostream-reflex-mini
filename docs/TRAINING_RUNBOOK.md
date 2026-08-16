@@ -35,8 +35,11 @@
 
 | 路线 | 起点 | 适用 |
 |------|------|------|
-| **A（推荐）** | `pretrain_final.pt` | 有干净预训练产物 |
-| B | `sft_kd_150k_final.pt` | 只有旧 SFT 产物（它含预训练能力，可当起点：`cp sft_kd_150k_final.pt $CKPT/pretrain_final.pt`） |
+| **A（推荐）** | `pretrain_final.pt` | 有干净预训练产物（228882 步 ≈ 15B tokens，完整） |
+| B | `sft_kd_150k_final.pt` | 只有旧 SFT 产物（含预训练能力，可当起点） |
+| **立即部署验证** | `distill_refined_final.pt` | **不用等新训练**：这是已完整跑过 SFT→KD→精修的最终模型（语言能力为现有 4 个 checkpoint 中最好），可直接用于 §6 的主动提问/自我进化验证，与新训练并行 |
+
+> 注意：`distill_refined_final.pt` 的 SelfModel/Critic 未跑 warmup（实测仍为随机初始化），部署时内循环会从零在线学习——这正是"部署即学习"的验证场景，不影响语言能力部分。
 
 ---
 
@@ -53,15 +56,17 @@ df -h /root/autodl-tmp   # 需要 ≥ 100GB
 
 **需上传到服务器的文件**（AutoDL 实例释放后重新上传）：
 
-| 文件 | 来源 | 必需 | 用途 |
-|------|------|------|------|
+| 文件 | 本地位置 | 必需 | 用途 |
+|------|---------|------|------|
 | 项目代码（本仓库，含本次修复） | GitHub clone | ✅ | 全部训练/部署代码 |
-| `pretrain_final.pt`（~9GB） | 本地保存 | ✅（路线 A） | SFT 起点 |
-| `sft_kd_150k_final.pt`（~8GB） | 本地已有 | 路线 B 备用 | 兜底起点 |
-| `sft_kd_clean.jsonl`（~2GB） | 本地保存 | ✅ | SFT 主数据 |
+| `pretrain_final.pt`（7.94GB，228882 步） | `D:\codingfile\pretrain_final.pt` | ✅（路线 A） | 新 SFT 起点 |
+| `sft_kd_clean.jsonl`（0.1GB，99,982 条） | `D:\codingfile\sft_kd_clean.jsonl` | ✅ | SFT 主数据 |
+| `distill_refined_final.pt`（7.94GB，KD+精修完整） | `D:\codingfile\distill_refined_final.pt` | ✅（部署验证） | 立即部署验证 §6，与新训练并行 |
+| `sft_kd_150k_final.pt`（7.94GB，SFT 3000 步） | `D:\codingfile\sft_kd_150k_final.pt` | 可选 | 路线 B 备用 |
+| `pretrain_step220000.pt`（7.94GB，中间产物） | `D:\codingfile\pretrain_step220000.pt` | 可选 | 备用（loss 9.69 甚至低于 final） |
 | `qwen2.5-0.5b/`、`qwen2.5-1.5b-instruct/` | 重新下载（~4GB） | ✅ | tokenizer + teacher |
 
-> 注：checkpoint/数据文件因 GitHub 单文件 100MB 限制**不入库**，需手动上传（可用 AutoDL 的网盘/SCP/oss 传输）。
+> 注：checkpoint/数据文件因 GitHub 单文件 100MB 限制**不入库**，需手动上传（AutoDL 网盘/SCP/oss 传输）。5 个文件共 ~32GB。
 
 ```bash
 # 上传后确认
@@ -266,10 +271,16 @@ python chat_sft.py --checkpoint .../sft_final.pt --device cuda \
 
 ```bash
 cd /root/autodl-tmp/neurostream_reflex_v2_mini
-python run_mini.py --checkpoint /root/autodl-tmp/checkpoints/reflex-mini/distill_refined.pt \
+# 立即验证（现有模型，无需等训练）：distill_refined_final.pt
+python run_mini.py --checkpoint /root/autodl-tmp/checkpoints/reflex-mini/distill_refined_final.pt \
     --tokenizer /root/autodl-tmp/data/qwen2.5-0.5b
+# 新训练完成后：改用 distill_refined.pt（新流程产物）
 # stats 查看内循环；clear 清记忆；quit 退出
 ```
+
+> **两条并行路线**：
+> 1. **立即**：上传 `distill_refined_final.pt` → 直接开始 §6.2/6.3 实验（验证现有模型是否会主动提问/自我进化）——不等新训练；
+> 2. **训练中**：同时跑 `run_pipeline.sh` 新流程（组织语言优先），产出新 `distill_refined.pt` 后复测同一组实验，对比新旧模型的行为差异。
 
 ### 6.2 实验一：主动提问验证（模型会不会问）
 
