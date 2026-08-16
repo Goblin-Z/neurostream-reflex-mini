@@ -565,6 +565,10 @@ class ReflexModel(nn.Module):
         Multi-token markers (like <|User|>) are not added as individual
         tokens because common tokens like '|' or 'User' would trigger
         premature stopping.
+
+        FIX 2026-08: Qwen chat template 的轮次终止符 <|im_end|> 是单 token
+        (id 151645) 且 SFT 标签会监督它——但此前未加入 stop_ids，导致模型
+        生成 <|im_end|> 后继续续写（"不会适时停止回答"的直接根因）。
         """
         if hasattr(self, '_cached_stop_ids') and self._cached_stop_ids is not None:
             return self._cached_stop_ids
@@ -576,8 +580,8 @@ class ReflexModel(nn.Module):
         if hasattr(tok, 'eos_token_id') and tok.eos_token_id is not None:
             ids.add(tok.eos_token_id)
         # Only add markers that encode to a SINGLE token
-        for marker in ('\uff5cUser\uff5c', '|User|', '<｜User｜>', '<|User|>',
-                       '｜User｜', '<｜end▁of▁sentence｜>'):
+        for marker in ('<|im_end|>', '\uff5cUser\uff5c', '|User|', '<｜User｜>',
+                       '<|User|>', '｜User｜', '<｜end▁of▁sentence｜>'):
             try:
                 encoded = tok.encode(marker, add_special_tokens=False)
                 if len(encoded) == 1:

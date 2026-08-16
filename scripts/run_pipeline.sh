@@ -51,22 +51,22 @@ else
   echo "[skip] qa_tpl_20k.jsonl 已存在"
 fi
 
-# ── 阶段 0b: self-instruct QA 4万 ────────────────────────
+# ── 阶段 0b: self-instruct QA 8万（2026-08 扩量：教师自产问题多样性高，是问答能力主力）──
 if [ ! -f "$DATA/qa_si_40k.jsonl" ]; then
-  step "0b. 生成 self-instruct QA (4万)"
+  step "0b. 生成 self-instruct QA (8万)"
   python -u scripts/generate_qa.py --teacher $TEACHER \
     --output $DATA/qa_si_40k.jsonl \
-    --max-samples 40000 --mode self-instruct --batch-size $BS --device cuda
+    --max-samples 80000 --mode self-instruct --batch-size $BS --device cuda
 else
   echo "[skip] qa_si_40k.jsonl 已存在"
 fi
 
-# ── 阶段 0c: multi-turn 对话 4万 ─────────────────────────
+# ── 阶段 0c: multi-turn 对话 8万（2026-08 扩量：追问池已从 25 条扩充到 65 条）──
 if [ ! -f "$DATA/mt_40k.jsonl" ]; then
-  step "0c. 生成多轮对话 (4万)"
+  step "0c. 生成多轮对话 (8万)"
   python -u scripts/generate_qa.py --teacher $TEACHER \
     --output $DATA/mt_40k.jsonl \
-    --max-samples 40000 --mode multi-turn --batch-size $BS --device cuda
+    --max-samples 80000 --mode multi-turn --batch-size $BS --device cuda
 else
   echo "[skip] mt_40k.jsonl 已存在"
 fi
@@ -85,10 +85,10 @@ fi
 # ── 阶段 0e: 生成澄清式提问对话数据（核心：训练"逻辑提问"能力）──
 # 信息不足请求 → 主动提问 → 用户补充 → 完整回答。可选但强烈推荐。
 if [ ! -f "$DATA/clarify_30k.jsonl" ]; then
-  step "0e. 生成澄清式提问数据 (3万条)"
+  step "0e. 生成澄清式提问数据 (5万条)"
   python -u scripts/generate_ask_data.py --teacher $TEACHER \
     --output $DATA/clarify_30k.jsonl \
-    --max-samples 30000 --batch-size $BS --device cuda
+    --max-samples 50000 --batch-size $BS --device cuda
 else
   echo "[skip] clarify_30k.jsonl 已存在"
 fi
