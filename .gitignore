@@ -11,3 +11,16 @@ nohup.out
 # Python
 __pycache__/
 *.pyc
+
+# 文档（设计文档/训练手册不公开）
+docs/
+
+# 验证脚本（无关紧要的本地验证文件）
+final_verify.py
+verify_final.py
+verify_mini_v3.py
+
+# 训练管线（训练代码保留在本地，不公开）
+train/
+scripts/
+train_memory.py
