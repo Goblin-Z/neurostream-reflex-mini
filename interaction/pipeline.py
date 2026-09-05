@@ -35,6 +35,23 @@ class ReflexPipeline:
         self._chat_history = []          # list of {'role': 'user'/'assistant', 'content': str}
         self._max_history_turns = 8      # 最多保留 8 轮
         self._max_history_chars = 2000   # 历史总字符上限（防止超长）
+        # 用户事实记忆（显式提取，作为 system 提示注入——16B 小模型
+        # 无法靠 3 轮前的注意力稳定关联"我叫小蒙"这类细节，必须显式注入）
+        self._user_facts = []
+
+    def _extract_user_facts(self, text):
+        """从用户消息抽取可记忆事实（自我介绍），注入 system 提示。"""
+        import re
+        for pat in (r'我(?:的)?名字(?:叫|是)\s*([^\s，。,.!！?？]{1,10})',
+                    r'我叫\s*([^\s，。,.!！?？]{1,10})'):
+            m = re.search(pat, text)
+            if m:
+                name = m.group(1).strip()
+                if name and name not in self._user_facts:
+                    self._user_facts.append(f'用户的名字叫{name}')
+                    if getattr(self.config, 'graft_gen_debug', False):
+                        print(f'  [MEM] 记忆用户事实: {self._user_facts[-1]}')
+                return
 
     def set_tokenizer(self, tokenizer):
         self.tokenizer = tokenizer
@@ -153,7 +170,9 @@ class ReflexPipeline:
                 # （想象输出与对话语义对齐，Hebbian 梯度获得外部方向）
                 self.model._last_dialog_emb = emb[0].detach()
                 alpha = getattr(self.config, 'dialog_memory_alpha', 0.3)
-                new_h = (alpha * emb + (1 - alpha) * h.to(emb.device))
+                # dtype 统一：h 必须与 emb 一致（bf16 嫁接模式下 h 可能是 fp32）
+                new_h = (alpha * emb + (1 - alpha) *
+                         h.to(device=emb.device, dtype=emb.dtype))
                 self.model._h_state = new_h.detach()
                 # 同步到 endosphere（内循环 get_latest 可读取）
                 self.model.endosphere.push(emb[0].detach().cpu(), sigma=0.5)
@@ -165,41 +184,56 @@ class ReflexPipeline:
             pass  # 记忆注入是 best-effort，永不打断对话
 
     def _store_round_memory(self):
-        """L4 内容记忆：收集本轮各层 KV 存入 MemoryBank（FIFO）。"""
+        """L4 内容记忆：收集本轮各层 KV 存入 MemoryBank（FIFO）。
+
+        嫁接模式：仅全注意力层产生 KV（model.kv_layers），线性注意力层跳过；
+        MemoryBank 按 kv_layers 顺序存储（get_kv 的位置索引 = 列表内位置）。
+        """
         mb = getattr(self.model, 'memory_bank', None)
         if mb is None:
             return
         try:
+            kv_idxs = self.model.kv_layers
             layer_kvs = []
-            for layer in self.model.layers:
-                attn = layer.attention
+            for i in kv_idxs:
+                attn = self.model.layers[i].attention
                 if getattr(attn, '_last_kv', None) is None:
                     return  # 本轮 forward 未缓存 KV（非训练模式）
                 k, v = attn._last_kv   # [B, n_kv, T, hd]
+                # 保持模型 dtype（bf16 嫁接模式下不能转 float32，
+                # 否则后续注意力拼接 dtype 冲突）
                 layer_kvs.append(
-                    (k[0].float().cpu(), v[0].float().cpu()))
-            mb.add_round_kv(layer_kvs, text='round')
+                    (k[0].cpu(), v[0].cpu()))
+            if layer_kvs:
+                mb.add_round_kv(layer_kvs, text='round')
         except Exception:
             pass
 
     def _build_mem_kv(self):
-        """L4 读取：从 MemoryBank 构建 {layer_idx: (mem_k, mem_v)}。"""
+        """L4 读取：从 MemoryBank 构建 {layer_idx: (mem_k, mem_v)}。
+
+        嫁接模式：mem_kv 的 key 为真实层索引（全注意力层），
+        MemoryBank.get_kv 用 kv_layers 列表内的位置索引。
+        """
         mb = getattr(self.model, 'memory_bank', None)
         if mb is None or not getattr(self.config, 'memory_enabled', True):
             return None
         try:
+            kv_idxs = self.model.kv_layers
+            if not kv_idxs:
+                return None
+            dev = next(self.model.parameters()).device
+            model_dtype = next(self.model.parameters()).dtype
             mem_kv = {}
-            for i, layer in enumerate(self.model.layers):
-                kv = mb.get_kv(i)
+            for pos, i in enumerate(kv_idxs):
+                kv = mb.get_kv(pos)
                 if kv is None:
                     return None
                 mem_k, mem_v = kv
                 if mem_k.size(1) == 0:
                     return None
-                mem_kv[i] = (mem_k.unsqueeze(0).to(
-                    next(self.model.parameters()).device),
-                    mem_v.unsqueeze(0).to(
-                        next(self.model.parameters()).device))
+                mem_kv[i] = (mem_k.unsqueeze(0).to(device=dev, dtype=model_dtype),
+                             mem_v.unsqueeze(0).to(device=dev, dtype=model_dtype))
             return mem_kv
         except Exception:
             return None
@@ -222,10 +256,19 @@ class ReflexPipeline:
         # ── 构造带历史的输入 ──
         self._chat_history.append({'role': 'user', 'content': str(text)})
         self._trim_history()
+        self._extract_user_facts(str(text))
+
+        # 用户事实作为 system 消息置顶（DeepSeek 模板支持 system 段；
+        # 显式注入让"我叫小蒙"直达模型注意力，不再依赖 3 轮前的隐式记忆）
+        messages = list(self._chat_history)
+        if self._user_facts:
+            messages = ([{'role': 'system',
+                          'content': '对话事实：' + '；'.join(self._user_facts) + '。'}]
+                        + messages)
 
         if getattr(self.tokenizer, 'chat_template', None):
             prompt_str = self.tokenizer.apply_chat_template(
-                self._chat_history, tokenize=False,
+                messages, tokenize=False,
                 add_generation_prompt=True)
         else:
             prompt_str = text
@@ -235,11 +278,15 @@ class ReflexPipeline:
         input_ids = input_ids.to(next(self.model.parameters()).device)
         if input_ids.size(1) == 0:
             return ""
+        # 供内循环 Stage H 验证问题使用：记录最近一次【对话】输入
+        # （区别于模型前向的 _last_input_ids——它会被内循环 Stage A 覆盖）
+        self.model._last_query_ids = input_ids.clone()
+        self.model._last_query_text = str(text)
 
         with self.model._lock:
-            # L4: 开启 KV 缓存 + 构建记忆 KV
-            for layer in self.model.layers:
-                layer.attention._kv_cache_enabled = True
+            # L4: 开启 KV 缓存 + 构建记忆 KV（嫁接模式只开全注意力层）
+            for i in self.model.kv_layers:
+                self.model.layers[i].attention._kv_cache_enabled = True
             mem_kv = self._build_mem_kv()
             # 内外循环一致化：生成带内循环最新状态（Router 状态门控）
             h_state = getattr(self.model, '_h_state', None)
@@ -313,6 +360,14 @@ class ReflexPipeline:
     # ── Training ───────────────────────────────────────────────────
 
     def _train_on_full(self, full_ids, feedback_ctx=None, reply_start=None):
+        # 嫁接模式可关闭每轮全量 CE 在线训练（27B 上最重的路径；
+        # Hebbian/内循环学习不受影响——focal boost 仍照常推送）
+        if not getattr(self.config, 'graft_online_ce', True):
+            if feedback_ctx is not None and feedback_ctx.get('expert_id'):
+                self.model.push_focal_boost(
+                    feedback_ctx.get('expert_id'),
+                    feedback_ctx.get('focal_boost', 1.0))
+            return
         # H5 fix: truncate to max_seq_len to prevent position embedding overflow
         max_len = self.config.max_seq_len
         if full_ids.size(1) > max_len:
@@ -323,6 +378,11 @@ class ReflexPipeline:
         # "何时回忆、如何带着想法思考"
         mem_kv = self._build_mem_kv()
         h_state = getattr(self.model, '_h_state', None)
+        if h_state is not None:
+            # 内循环状态可能是 fp32（SelfModel 域）；训练路径对齐模型 dtype
+            # （router 内部另有 fp32 域统一，此处为调用侧防御 v3.18）
+            model_dtype = next(self.model.parameters()).dtype
+            h_state = h_state.to(dtype=model_dtype)
         logits = self.model(full_ids, mem_kv=mem_kv, h_state=h_state)
 
         shift = full_ids[:, 1:]
@@ -424,12 +484,18 @@ class ReflexPipeline:
 
         # Batch gradient computation per layer (O(n) not O(n^2))
         from loop.gradient_manager import GradientManager
-        gm = GradientManager(len(self.model.layers))
+        # 嫁接轻量模式：Hebbian 只覆盖最后 graft_hebbian_layers 层（显存/算力预算）
+        hebb_layers = self.model.layers
+        if (getattr(self.config, 'graft_lite', False)
+                and getattr(self.config, 'backbone', '') != 'reflex'):
+            k = getattr(self.config, 'graft_hebbian_layers', 8)
+            hebb_layers = self.model.layers[-k:]
+        gm = GradientManager(len(hebb_layers))
 
         target_found = False
 
         for layer_idx, layer, retain in gm.iterate_layers(
-                loss, self.model.layers
+                loss, hebb_layers
         ):
             captured = [(e, e._output) for e in layer.all_experts
                          if e._output is not None and e._output.requires_grad]

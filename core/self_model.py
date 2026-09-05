@@ -211,6 +211,11 @@ class SelfModel(nn.Module):
         self._last_post_weights = None
 
     def forward(self, h: torch.Tensor, z: torch.Tensor, action: torch.Tensor):
+        # dtype 统一：模型可能整体为 bf16（嫁接模式），外部状态可能是 fp32
+        dt = next(self.parameters()).dtype
+        h = h.to(dtype=dt)
+        z = z.to(dtype=dt)
+        action = action.to(dtype=dt)
         gru_in = torch.cat([h, z, action], dim=-1)
         h_next = self.gru(gru_in, h)
 
@@ -218,10 +223,16 @@ class SelfModel(nn.Module):
         return h_next, z_prior_mean, z_prior_logvar
 
     def observe_and_correct(self, h: torch.Tensor, o: torch.Tensor):
+        dt = next(self.parameters()).dtype
+        h = h.to(dtype=dt)
+        o = o.to(dtype=dt)
         z_post_mean, z_post_logvar = self._posterior(h, o)
         return z_post_mean, z_post_logvar
 
     def decode(self, z: torch.Tensor, h: torch.Tensor):
+        dt = next(self.parameters()).dtype
+        z = z.to(dtype=dt)
+        h = h.to(dtype=dt)
         return self.decoder(torch.cat([z, h], dim=-1))
 
     def sample_z(self, mean: torch.Tensor, logvar: torch.Tensor, temperature=1.0):
@@ -242,11 +253,14 @@ class SelfModel(nn.Module):
         return kl.sum(dim=-1).mean()
 
     def init_state(self, seed=None, device=None):
+        # dtype 与模型参数一致（bf16 嫁接模式下不能默认 fp32）
+        dt = next(self.parameters()).dtype
+        dev = device if device is not None else next(self.parameters()).device
         if seed is not None:
-            h = self.init_proj(seed)
+            h = self.init_proj(seed.to(device=dev, dtype=dt))
         else:
-            h = torch.zeros(1, self.d_model, device=device)
-        z = torch.zeros(1, self.z_dim, device=device)
+            h = torch.zeros(1, self.d_model, device=dev, dtype=dt)
+        z = torch.zeros(1, self.z_dim, device=dev, dtype=dt)
         return h, z
 
     def get_mode_stats(self):

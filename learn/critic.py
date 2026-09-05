@@ -41,7 +41,9 @@ class ReflexCritic(nn.Module):
     def forward(self, state_vector):
         if state_vector.dim() == 1:
             state_vector = state_vector.unsqueeze(0)
-        x = self.input_ln(state_vector.float())
+        # 不强制 float：RMSNorm 内部按输入 dtype 计算（bf16 嫁接模式下
+        # 强制 fp32 会导致后续 Linear(bf16) 与 fp32 输入 dtype 不匹配）
+        x = self.input_ln(state_vector)
         return self.net(x)
 
     def get_normalized_v(self, state_vector):

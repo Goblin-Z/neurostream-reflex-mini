@@ -118,3 +118,13 @@ def focal_update(grad_y, expert, lr, base_gamma=1.0, focus_boost=1.0):
         if expert.w_up.bias is not None:
             delta_b_up = grad_u.sum(dim=0)
             expert.w_up.bias.data -= update_scale * delta_b_up
+
+    # ── 观测仪表（不参与数学）：累计 Hebbian 权重修改量 ──
+    # stats 的 hebbian_drift 显示各专家此值最大值——"部署即学习"
+    # 对主干（Qwen FFN 权重）的真实修改量，与 global_drift（附加件）互补。
+    with torch.no_grad():
+        added = 0.0
+        for d in (delta_w_down, delta_w_gate, delta_w_up):
+            if d is not None and torch.isfinite(d).all():
+                added += float(update_scale * d.norm())
+        expert._hebbian_drift = getattr(expert, '_hebbian_drift', 0.0) + added

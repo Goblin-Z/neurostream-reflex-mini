@@ -1,0 +1,73 @@
+NeuroStream-Reflex DeepSeek-V2-Lite Graft — 上传包版本
+v3.14 (verify-q2) · 2026-09-05
+========================================================
+v3.14 修复: 主动求证问题生成二次修复——
+         ① seed 构建：apply_chat_template(return_tensors='pt') 返回
+           dict，须取 ['input_ids']（v3.13 误用 dict.to → AttributeError
+           被吞 → "耗时 0s 生成失败"）
+         ② 失败冷却：验证问题生成失败后 200 步内不再重试（原每 20 步
+           无限重试刷屏）
+
+v3.13 修复: 主动求证（Stage H）问题生成失败修复——
+         ① seed 改为对话模板构造（原裸文本 → Chat 模型首 token 即 eos）
+         ② 采样参数对齐 DeepSeek 官方（top_k=0 / top_p=0.95 / 无重复惩罚）
+         ③ 反馈上下文 query_ids 改用 model._last_query_ids
+
+v3.12 更新: 可塑档路由专家 lr ×8（1e-2 → 8e-2），其余专家各提升一个量级：
+         路由 16×1e-5 / 32×1e-4 / 16×8e-2，共享 1e-4，dense 1e-5。
+
+v3.11 更新: 可塑档路由专家 lr 第三次提升一个量级（1e-3 → 1e-2）。
+
+v3.10 更新: 可塑档路由专家 lr 再提升一个量级（1e-4 → 1e-3）。
+
+v3.9 更新: 学习率光谱各提升一个量级（三档保持）——
+         路由专家 16×1e-6 / 32×1e-5 / 16×1e-4（原 1e-7/1e-6/1e-5），
+         共享专家 1e-5（原 1e-6），dense 层 1e-6（原 1e-7）。
+
+v3.8 更新（对话质量两项关键修复）:
+  ① run_mini.py 对 graft 主干强制 DeepSeek Chat 官方采样参数
+     （temp=0.3 / top_p=0.95 / top_k=0 / 无重复惩罚）——Qwen 时代默认
+     repetition_penalty=1.5 会把常用词惩罚掉，Chat 长回答退化为
+     emoji/符号洪水；旧 checkpoint 无需重新生成。
+  ② pipeline 用户事实记忆注入：从用户消息抽取自我介绍（"我叫X"/
+     "我的名字是X"）→ 作为 system 消息置顶注入对话模板——16B 小模型
+     无法靠多轮隐式注意力关联用户细节，显式注入让名字等事实直达模型；
+     --gen-debug 时打印 [MEM] 记忆用户事实。
+
+v3.7 更新:
+  ① run_mini.py --hebbian-lr 0 现在同时关闭路由/共享/密集全部专家
+     （此前只关路由专家，共享 1e-6 残留更新导致 hebbian_drift 增长，
+       Hebbian 开/关对照不彻底）
+  ② 新增 scripts/switch_to_chat.sh：一键下载 DeepSeek-V2-Lite-Chat
+     权重 → 生成 Chat 嫁接 checkpoint → 数值验证 → 打印运行命令
+     （Chat 版与 base 同架构，嫁接代码零改动；对话体验需 Chat 版）
+
+v3.6 修复: YaRN rope 旋转改在 fp32 中完成（cos/sin 保持 fp32，旋转后
+         最后才转回 x.dtype）——与 built-in 的 complex64 复数乘法路径
+         一致；此前在 bf16 中旋转，每层 ~1e-3 确定性差异累积。
+         ★ checkpoint 无需重新生成，重传本包 → 直接重跑 verify/run_mini。
+         ⚠ 若此轮 top-1 仍 ≈78%：即 bf16 27 层 MoE 的固有内核噪声 +
+           路由分叉（fp32 下本地已证 6e-8 / top-1 100%，架构与权重
+           映射完全正确），可以接受并正常使用模型。
+
+v3.5 修复: attention 显式 causal mask + is_causal=False（与 5.x sdpa 同路径）。
+
+v3.4 修复: MoE 专家组合 top-k 权重乘法精度对齐 built-in（bf16×fp32→fp32→bf16）。
+
+v3.3 修复（关键）:
+  ① YaRN RoPE interleaved 布局 + cos/sin 取前 D//2 列 + softmax_scale
+     无 mscale² —— 与 transformers 5.x built-in 逐位对齐。
+     此前: v3 interleaved(0::2) → top-1 64%；v3.2 half-split → 14%。
+  ② global_drift 快照错位崩溃修复（zip 同列表遍历）。
+
+v3.1 修正: 总参数 23.0xB 是【正确值】；checkpoint ≈46GB 正常。
+
+v3 修复: all_experts / stable_experts / plastic_experts 改为普通 list，
+         消除 MoE 专家重复注册。
+
+核对方法（解压后先执行）:
+  1) cat VERSION.txt             → 应显示 v3.7 (chat-switch)
+  2) md5sum core/model.py        → 见交付说明中的校验值（若不符 = 旧包）
+  3) 运行 load_deepseek_graft.py 应打印:
+       模型总参数: 23.0xB（正确值）
+       [OK] 参数无重复注册（... 个参数张量）

@@ -44,8 +44,10 @@ class InteractionManager:
         self._config = config  # 保存引用（warmup 冷却配置）
 
         # Session limits (soft caps, not hard cooldowns)
+        # 会话提问上限：config 可配（0 = 无限）；默认 5（防骚扰）
         self._questions_this_session = 0
-        self._max_questions_per_session = 5
+        self._max_questions_per_session = getattr(
+            config, 'max_questions_per_session', 5) if config else 5
 
         # Sigma tracking for emergent cooldown
         self._current_model_sigma = 0.0
@@ -113,7 +115,9 @@ class InteractionManager:
                     < self._verify_warmup_cooldown):
                 return False
             return (self._state == self.IDLE
-                    and self._questions_this_session < self._max_questions_per_session
+                    and (self._max_questions_per_session <= 0
+                         or self._questions_this_session
+                         < self._max_questions_per_session)
                     and self._current_model_sigma > self._sigma_threshold)
 
     def update_sigma(self, sigma, step=None):
@@ -137,7 +141,9 @@ class InteractionManager:
         with self._lock:
             if self._state != self.IDLE:
                 return False
-            if self._questions_this_session >= self._max_questions_per_session:
+            if (self._max_questions_per_session > 0
+                    and self._questions_this_session
+                    >= self._max_questions_per_session):
                 return False
             if self._current_model_sigma <= self._sigma_threshold:
                 return False

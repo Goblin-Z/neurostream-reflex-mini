@@ -1,144 +1,56 @@
-# NeuroStream-Reflex Mini
+﻿# NeuroStream-Reflex × DeepSeek-V2-Lite-Chat（嫁接实现）
 
-[简体中文](README.zh-CN.md) | English
+NeuroStream-Reflex 双循环框架（内循环意识 / 主动求证 / 边缘混沌 / 部署即学习）嫁接在 DeepSeek-V2-Lite-Chat 之上的代码包。
 
-**A 0.77B Chinese neuromorphic language model** — dual-loop architecture with external training and internal stream of consciousness. Memory and thought blend at every computation step, forming a continuously advancing self-referential loop.
+## 模型与 Tokenizer（下载）
 
-## Highlights
+权重与分词器在魔搭社区（本仓库**不含**模型文件）：
 
-### Why dual-loop?
-
-The model does not merely respond to input — it continuously *thinks* even when nobody is talking.
-
-- **Outer loop (interaction)**: turns input + memory + state into dialogue. This is the model's "action" layer — fast, responsive, grounded in the current conversation.
-- **Inner loop (consciousness)**: runs continuously in the background — evolving internal state, strengthening experts (Hebbian), consolidating memory, and evaluating its own uncertainty. This is the "reflection" layer — slow, self-referential, independent of external stimuli.
-
-Together they form a **self-referential cycle**: every computation changes the state; the new state determines the next computation. What the model remembers shapes what it thinks; what it thinks becomes new memory. The cycle is closed at two scales — a micro-cycle inside (state → think → new state) and a macro-cycle across interactions (converse → learn → remember → converse differently).
-
-### Proactive verification (knowing what it doesn't know)
-
-The model can **ask questions when it is confused**:
-
-- Its experts carry an internal uncertainty signal (sigma). When sigma exceeds a threshold, the model recognizes it is not sure — not by rule, but by its own internal state.
-- It then generates a clarification question from its confused state and asks the user.
-- Your answer becomes a learning signal (focal boost on the confused expert) — the model updates, sigma drops, and it stops asking (emergent cooldown: learning itself is the cooldown, no timers).
-- If a question remains unresolved (sigma stays high), it will ask again — genuine curiosity loop, not a script.
-
-This is a primitive form of **metacognition**: the model monitors its own uncertainty and acts on it, closing the "confusion → ask → learn → resolve" loop.
-
-### Multi-level memory
-
-- **Verbatim recent memory**: attention reaches historical token representations directly — the model can recall what was actually said, not just a summary
-- **Conversation gist**: internal state encodes what the conversation is about
-- **Long-term knowledge**: a learnable memory bank keeps semantic memories
-- **Spontaneous consolidation**: the more the model *uses* a memory (measured by its own attention), the more important it becomes — mature memories are distilled into weights automatically, no fixed schedule
-
-### Learn while deployed
-
-The model keeps learning *during deployment* — every conversation is also a training step:
-
-- **Online training**: after each reply, the model fine-tunes on the conversation (with memory and state engaged) — the more you talk, the better it gets at *this* kind of dialogue
-- **Hebbian updates**: experts strengthen in real time on every internal step
-- **Spontaneous consolidation**: frequently used memories are distilled into weights automatically
-- **Architecture self-modification**: expert split/prune/add-layer happen while running
-
-It is a system that learns from use — not a frozen artifact.
-
-### Other highlights
-
-- **Hebbian learning**: experts strengthen through local correlation ("neurons that fire together wire together"), not global backprop
-- **Architecture self-modification**: the model can split/prune/add experts as it learns
-
-## Quick Start
-
-### Deploy (internal loop fully enabled)
+- **下载地址**：https://modelscope.cn/models/Marshauv/Neurostream_reflex_deepseek_chat
+- 文件：`reflex_dsv2lite_graft.pt`（46GB bf16，23.03B 参数 = 15.7B DeepSeek 主干 1:1 直拷 + ~7.3B Reflex 附加件）、`tokenizer.json`、`tokenizer_config.json`
 
 ```bash
-python run_mini.py --checkpoint <ckpt.pt> --device cuda
-# Interactive: ask questions / "quit" to exit / "stats" for internal state / "clear" to reset memory
+# 下载模型（魔搭）
+modelscope download --model Marshauv/Neurostream_reflex_deepseek_chat \
+    --local_dir /root/autodl-tmp/models/Neurostream_reflex_deepseek_chat
 ```
 
-### Test a checkpoint
+## 快速开始
 
 ```bash
-python chat_sft.py --checkpoint <ckpt.pt> --device cpu --prompt "中国的首都是"
+pip install torch transformers safetensors tqdm modelscope
+bash run_chat.sh
+# 常用附加参数:
+#   --verify-threshold 0.3   主动求证触发阈值（σ 校准后建议 0.3）
+#   --online-ce              打开每轮 CE 在线训练
+#   --hebbian-lr 0           关闭 Hebbian（对照/回炉）
 ```
 
-## Architecture
-
-```
-                        ┌──────────────────────────────────────────┐
-                        │              MEMORY SYSTEM                │
-                        │  verbatim (KV cache)  gist (h_t)  knowledge│
-                        │  (learnable slots)                        │
-                        └────▲────────────▲─────────────▲───────────┘
-                             │            │             │
-   OUTER LOOP (interaction)  │   writes   │   reads     │
-   ┌────────────┐  generate ┌┴───────┐    │             │
-   │ user input │───►───────│ THINK  │◄───┴─────────────┘
-   └────────────┘           └───┬────┘     (h_state + memory)
-                                │ new state / memory
-   INNER LOOP (consciousness)   ▼
-   ┌──────────────────────────────────────────────────────┐
-   │  every step (continuous, no external input needed):  │
-   │  A. take state → noise → imagine (SelfModel) → think │
-   │  B. Hebbian update (strengthen used experts)         │
-   │  C. world-model learning + critic value              │
-   │  D. write state → memory (KV/slots/dialectics)       │
-   │  E/F. consolidate (distill memory into weights)      │
-   │  H. proactive verification (high sigma → ask user)   │
-   │  memory participates in every computation step;      │
-   │  every step produces new memory for the next one     │
-   └──────────────────────────────────────────────────────┘
-```
-
-**The loop is closed**: inner loop continuously evolves state/memory; outer loop reads that state to speak; speaking writes new memory back into the loop. One self-referential cycle at two scales.
-
-| Component | Description |
-|-----------|-------------|
-| `core/` | Model backbone (MoE/Attention/SelfModel/MemoryBank) |
-| `loop/` | Inner loop (stream of consciousness: Hebbian/consolidation) |
-| `learn/` | Online learning (Hebbian updates/Critic) |
-| `interaction/` | External interaction (dialogue/verification/feedback) |
-| `config/` | Model configuration |
-
-## Model Spec
-
-- **Architecture**: 24-layer GQA + RoPE + SwiGLU MoE (4 stable + 2 plastic experts) + block Delta attention residuals
-- **Vocabulary**: Qwen2.5 (151936)
-- **Parameters**: 769M
-- **Training**: 15B tokens Chinese pretraining + teacher (Qwen2.5-1.5B-Instruct) QA/multi-turn distillation
-- **Memory**: 128 learnable memory slots + 4-round KV conversation cache + attention-based spontaneous consolidation
-
-## Deploy Command Reference
-
-| Command | Function |
-|---------|----------|
-| `stats` | Internal loop state (steps/loss_int/sigma/can_ask/errors) |
-| `clear` | Reset conversation memory (L0 history + KV) |
-| `quit` | Exit |
-| `--no-internal-loop` | Pure generation (comparison) |
-| `--no-arch-self-mod` | Disable architecture self-modification (on by default) |
-| `--verify-threshold 0.45` | Lower proactive-verification threshold |
-
-## Dependencies
+手动运行：
 
 ```bash
-pip install torch transformers safetensors tqdm
-export HF_ENDPOINT=https://hf-mirror.com   # mirror for China
+python run_mini.py --checkpoint reflex_dsv2lite_graft.pt \
+    --tokenizer <模型目录> --device cuda --dtype bfloat16 \
+    --no-online-ce --hide-think --gen-debug --sigma-cal
 ```
 
-## Known Limitations
+## 架构说明
 
-- 0.77B capacity: limited complex reasoning and long-form knowledge
-- Answering ability is bounded by training-data coverage (unseen instructions may be off-topic)
-- Effective memory use depends on memory fine-tuning (`train_memory.py`) — structure ready + training reinforced
-- Complex role-setting prompts work poorly (short-instruction interaction recommended)
+- 主干：DeepSeek-V2-Lite-Chat（27 层 MLA：1 dense + 26 MoE；64 路由专家 top-6 + 合并共享专家 1:1 直拷；YaRN rope）——权重零训练复用
+- Reflex 附加件（~7.3B）：每专家 query_proj + uncertainty_head（sigma）、SelfModel（GRU+VAE）、AttnRes、MemoryBank、Critic
+- 学习率光谱（仅影响 Hebbian）：路由 16×1e-5 / 32×1e-4 / 16×8e-2，共享 1e-4，dense 1e-5（run_mini 强制覆盖 checkpoint 旧值，`--hebbian-lr 0` 一键关闭）
+- 数值一致性：fp32 下与 transformers built-in 逐位一致（max|Δ|=6e-8、top-1 100%）；bf16 27 层 ≈78%（MoE 路由浮点内核噪声）
+- 主动求证（P3）：σ>阈值 → 模型从对话尾部续写涌现（`[MODEL SAYS]`）/ 无对话自由联想（`[MODEL FREE]` 观测模式）
 
-## License
+## 目录
 
-MIT License — neuromorphic research project, forks and improvements welcome.
+| 路径 | 说明 |
+|---|---|
+| `run_chat.sh` | 一键运行入口（下载/生成 checkpoint → 双循环对话） |
+| `run_mini.py` | 完整部署入口 |
+| `config/ core/ loop/ interaction/ learn/ improve/` | 反射框架运行模块（`improve/` 仅架构自修改；自博弈训练未发布） |
+| `scripts/` | 嫁接 checkpoint 生成 / 数值验证 / 冒烟测试 / Chat 切换 |
 
----
+## 许可
 
-*NeuroStream-Reflex Mini — a self-referential loop where memory and thought blend*
+项目代码：MIT；主干权重：DeepSeek-V2-Lite-Chat（MIT，deepseek-ai/DeepSeek-V2-Lite-Chat）——衍生权重保留 MIT，使用需遵守上游条款。

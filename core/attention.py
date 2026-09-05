@@ -28,7 +28,11 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.d_model = config.d_model
         self.n_heads = config.n_heads
-        self.head_dim = config.d_model // config.n_heads
+        # 显式 head_dim（Qwen3.x: head_dim 可不等于 d_model // n_heads）；0 = 自动
+        self.head_dim = getattr(config, 'head_dim', 0) or (config.d_model // config.n_heads)
+        # Qwen3.x attn_output_gate: q_proj 输出双倍宽度，一半 query 一半 sigmoid 门控
+        self.attn_gate = getattr(config, 'attn_gate', False)
+        self.q_out_dim = self.n_heads * self.head_dim * (2 if self.attn_gate else 1)
 
         # GQA: number of KV heads (defaults to n_heads if not specified)
         self.n_kv_heads = getattr(config, 'n_kv_heads', config.n_heads)
@@ -37,7 +41,7 @@ class MultiHeadAttention(nn.Module):
         self.n_rep = self.n_heads // self.n_kv_heads  # repeat factor
 
         # Projections
-        self.q_proj = nn.Linear(config.d_model, self.n_heads * self.head_dim,
+        self.q_proj = nn.Linear(config.d_model, self.q_out_dim,
                                 bias=False)
         self.kv_proj = nn.Linear(config.d_model, 2 * self.n_kv_heads * self.head_dim,
                                  bias=False)
@@ -54,9 +58,12 @@ class MultiHeadAttention(nn.Module):
 
         # RoPE
         rope_theta = getattr(config, 'rope_theta', 10000.0)
+        partial = getattr(config, 'partial_rotary_factor', 1.0)
+        rotary_dim = int(self.head_dim * partial) if partial < 1.0 else None
         self.rope = RoPE(self.head_dim,
                          max_seq_len=config.max_seq_len,
-                         theta=rope_theta)
+                         theta=rope_theta,
+                         rotary_dim=rotary_dim)
 
         self.attn_dropout = getattr(config, 'attention_dropout', config.dropout)
         self.out_dropout = nn.Dropout(config.dropout)
@@ -64,19 +71,29 @@ class MultiHeadAttention(nn.Module):
         # Scale factor
         self.scale = self.head_dim ** -0.5
 
-    def forward(self, x, attention_mask=None, is_causal=True, mem_kv=None):
+    def forward(self, x, attention_mask=None, is_causal=True, mem_kv=None,
+                rope_offset=0):
         """
         x: [B, T, d_model]
         attention_mask: [B, T] (1 = valid, 0 = padding)
         mem_kv: (mem_k, mem_v) from MemoryBank — 历史对话 KV，
                 拼接参与注意力（L4 内容记忆）。mem_k/mem_v: [B, H, T_mem, hd]
+        rope_offset: 增量解码起始位置（past 长度）；全量前向为 0
         Returns: [B, T, d_model]
         """
         B, T, _ = x.shape
 
-        # Q projection
-        q = self.q_proj(x)  # [B, T, n_heads * head_dim]
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        # Q projection (attn_gate: 双倍输出，一半 query 一半 gate)
+        q = self.q_proj(x)  # [B, T, q_out_dim]
+        if self.attn_gate:
+            # Qwen3.x 布局: [B, T, n_heads, head_dim*2] → chunk 后半为 gate
+            q = q.view(B, T, self.n_heads, self.head_dim * 2)
+            query_states, gate = torch.chunk(q, 2, dim=-1)
+            q = query_states.transpose(1, 2)
+            gate = gate.reshape(B, T, -1)  # [B, T, n_heads*head_dim]
+        else:
+            q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+            gate = None
         # q: [B, n_heads, T, head_dim]
 
         # KV projection
@@ -92,8 +109,8 @@ class MultiHeadAttention(nn.Module):
 
         # RoPE on Q and K
         seq_len = q.size(-2)
-        q = self.rope(q, seq_len)
-        k = self.rope(k, seq_len)
+        q = self.rope(q, seq_len, offset=rope_offset)
+        k = self.rope(k, seq_len, offset=rope_offset)
 
         # L4: 缓存本轮 KV（detach，供轮次结束写入 MemoryBank）
         if getattr(self, '_kv_cache_enabled', False):
@@ -157,5 +174,8 @@ class MultiHeadAttention(nn.Module):
 
         # Merge heads and output projection
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        # Qwen3.x attn_output_gate: out = o_proj(out * sigmoid(gate))
+        if gate is not None:
+            out = out * torch.sigmoid(gate)
         out = self.out_dropout(self.o_proj(out))
         return out

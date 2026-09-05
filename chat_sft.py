@@ -25,7 +25,11 @@ def main():
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--tokenizer', default=None,
                    help='HF id or local path (default: Qwen/Qwen2.5-0.5B)')
-    p.add_argument('--max-new-tokens', type=int, default=80)
+    p.add_argument('--max-new-tokens', type=int, default=900,
+                   help='生成上限（用户要求 900；仅为上限，模型输出 '
+                        '<|im_end|>/eos 会自动停止，不会强制跑满）')
+    p.add_argument('--hide-think', action='store_true',
+                   help='显示时剥离 <think>...</think> 思考块（只看最终答案）')
     p.add_argument('--temperature', type=float, default=0.7)
     p.add_argument('--top-p', type=float, default=0.9)
     p.add_argument('--prompt', action='append', default=None,
@@ -54,20 +58,34 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    print('Building ReflexMini...')
-    config = ReflexMiniConfig()
-    model = ReflexModel(config)
+    print('Building ReflexModel...')
     ckpt_path = args.checkpoint
     if not os.path.isabs(ckpt_path):
         ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ckpt_path)
     print(f'Loading checkpoint: {ckpt_path}')
-    ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    # mmap 加载：不把 54GB checkpoint 全量读进物理内存（需 torch>=2.1）
+    try:
+        ck = torch.load(ckpt_path, map_location='cpu', weights_only=False, mmap=True)
+    except TypeError:
+        ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    from config.model_config import config_from_checkpoint
+    config = config_from_checkpoint(ck)
+    model = ReflexModel(config)
+    # 显存/内存优化：加载前先转目标 dtype——
+    # fp32 中间态 = 29.45B×4B ≈ 118GB CPU RAM（叠加 54GB checkpoint 会被 OOM Killed）
+    load_dtype = dtype if device != 'cpu' else torch.float32
+    model.to(dtype=load_dtype)
     sd = ck.get('model_state_dict', ck)
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    print(f'  step={ck.get("step", "?")} phase={ck.get("phase", "?")}')
+    print(f'  step={ck.get("step", "?")} phase={ck.get("phase", "?")} '
+          f'backbone={getattr(config, "backbone", "reflex")}')
     print(f'  missing={len(missing)} unexpected={len(unexpected)}')
+    # 释放 checkpoint 引用（mmap 页缓存可回收）
+    del sd, ck
+    import gc
+    gc.collect()
     model._decode_tokenizer = tok
-    model.to(device=device, dtype=dtype if device != 'cpu' else torch.float32)
+    model.to(device=device, dtype=load_dtype)
     model.eval()
     n_params = sum(p.numel() for p in model.parameters())
     print(f'Ready | params={n_params:,} device={device} dtype={dtype}')
@@ -83,7 +101,12 @@ def main():
                 top_p=args.top_p,
                 repetition_penalty=1.2,
             )
-        return tok.decode(out[0], skip_special_tokens=True)
+        text = tok.decode(out[0], skip_special_tokens=True)
+        if args.hide_think:
+            import re
+            text = re.sub(r'<think>.*?</think>', '', text, flags=re.S)
+            text = re.sub(r'\s+', ' ', text).strip()
+        return text
 
     if args.prompt:
         for pr in args.prompt:
